@@ -1,0 +1,725 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+파고계 기반 파랑 분석 프레임워크 (기준 골격 v1)
+
+목적
+- csv / xlsx raw 데이터에서 파랑 분석을 단계적으로 확장하기 위한 단일 파일 골격
+- 기능을 한 번에 다 넣지 않고, 이후 대화 또는 Codex를 통해 분석 항목을 하나씩 추가
+- 코드 구조를 고정하여 추후 수정/추가 시 전체 형태가 흔들리지 않도록 함
+
+현재 구현 범위
+1) 입력 파일 경로 받기
+2) csv / xlsx 파일 읽기
+3) 컬럼명 정규화
+4) time_local 기반 공통 시간축 생성
+5) epoch_sec 보조 검증
+6) 출력 폴더 생성
+7) metadata 저장
+
+향후 추가 예정
+- 시간축 QA (dt, gap, duplicate, missing)
+- depth 이상치 제거(QC / despike)
+- 기준수면 제거(detrend)
+- 개별 파 검출(zero-crossing)
+- Hs / Hmax / Tz sliding window 통계
+- Hm0 / Tp / Tm01 / Tm02
+- Sea / Swell 분리
+- 장주기파(IG) 지표
+- 이벤트 탐지
+- 예보 비교 및 성능 평가
+"""
+
+# =========================================================
+# 0. Imports
+# =========================================================
+import json
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
+
+import pandas as pd
+
+
+# =========================================================
+# 1. User Config
+# =========================================================
+@dataclass
+class Config:
+    """
+    사용자 설정값 모음
+
+    원칙
+    - 향후 제어변수는 모두 이 클래스에만 추가
+    - 함수 내부에 하드코딩하지 않음
+    """
+
+    # -----------------------------------------------------
+    # 1-1. 입력 파일 표준 컬럼명
+    # -----------------------------------------------------
+    time_col: str = "time_local"          # 주 분석 시간축 컬럼
+    epoch_col: str = "epoch_sec"          # 보조 검증용 epoch 컬럼
+    depth_col: str = "depth_m"            # 수면 높이 또는 수심 계측값
+    wind_dir_col: str = "wind_dir_deg"    # 풍향 (현재는 읽기만 함)
+    wind_speed_col: str = "wind_speed"    # 풍속 (현재는 읽기만 함)
+
+    # -----------------------------------------------------
+    # 1-2. 샘플링 관련
+    # -----------------------------------------------------
+    expected_dt_sec: float = 0.1          # 기대 샘플링 간격(초)
+
+    # -----------------------------------------------------
+    # 1-3. 분석 기능 ON / OFF
+    # 현재는 틀만 유지, 실제 구현은 이후 단계에서 진행
+    # -----------------------------------------------------
+    run_timebase_qa: bool = True
+    run_depth_qc: bool = True
+    run_detrend: bool = True
+    run_wave_detection: bool = True
+    run_time_domain_stats: bool = True
+    run_spectral_stats: bool = False
+    run_swell_partition: bool = False
+    run_ig_analysis: bool = False
+    run_event_detection: bool = False
+
+    # -----------------------------------------------------
+    # 1-4. 출력 관련
+    # -----------------------------------------------------
+    output_root: str = "outputs"          # 결과 저장 루트 폴더
+    save_csv: bool = True
+    save_plot: bool = True
+
+
+# =========================================================
+# 2. Data Containers
+# =========================================================
+@dataclass
+class WaveData:
+    """
+    분석 중간 데이터 저장용 컨테이너
+
+    raw
+        원본 입력 데이터
+
+    cleaned
+        QA / QC / detrend 등을 거친 이후의 데이터
+
+    eta
+        기준수면 제거 후 수면변위 시계열
+
+    eta_short
+        단주기파 성분
+
+    eta_ig
+        장주기파(IG) 성분
+
+    waves
+        개별 파 검출 결과
+    """
+    raw: Optional[pd.DataFrame] = None
+    cleaned: Optional[pd.DataFrame] = None
+    eta: Optional[pd.Series] = None
+    eta_short: Optional[pd.Series] = None
+    eta_ig: Optional[pd.Series] = None
+    waves: Optional[pd.DataFrame] = None
+
+
+@dataclass
+class AnalysisResults:
+    """
+    분석 결과 저장용 컨테이너
+
+    meta
+        각 모듈별 메타정보 저장
+        예: 사용된 파라미터, 삭제된 행 수, 시간 범위, QC 결과 등
+
+    qa
+        시간축 QA 결과
+
+    qc
+        depth QC 결과
+
+    td_stats
+        시간영역 통계 결과 (Hs, Hmax, Tz 등)
+
+    spectral_stats
+        스펙트럼 통계 결과 (Hm0, Tp 등)
+
+    swell_stats
+        sea / swell 분리 결과
+
+    ig_stats
+        장주기파(IG) 관련 결과
+
+    events
+        threshold 기반 이벤트 탐지 결과
+    """
+    meta: Dict = field(default_factory=dict)
+    qa: Dict = field(default_factory=dict)
+    qc: Dict = field(default_factory=dict)
+    td_stats: Optional[pd.DataFrame] = None
+    spectral_stats: Optional[pd.DataFrame] = None
+    swell_stats: Optional[pd.DataFrame] = None
+    ig_stats: Optional[pd.DataFrame] = None
+    events: Optional[pd.DataFrame] = None
+
+
+# =========================================================
+# 3. Data I/O
+# =========================================================
+def prompt_input_file() -> Path:
+    """
+    터미널에서 분석 대상 파일 경로를 입력받는다.
+
+    지원 형식
+    - .csv
+    - .xlsx
+    - .xls
+    """
+    print("분석할 raw 데이터 파일 경로를 입력하십시오.")
+    print("지원 형식: .csv, .xlsx, .xls")
+
+    input_path = input("File path: ").strip().strip('"').strip("'")
+
+    if not input_path:
+        raise ValueError("파일 경로가 입력되지 않았습니다.")
+
+    file_path = Path(input_path).expanduser()
+
+    if not file_path.exists():
+        raise FileNotFoundError(f"파일을 찾을 수 없습니다: {file_path}")
+
+    if file_path.suffix.lower() not in [".csv", ".xlsx", ".xls"]:
+        raise ValueError(f"지원하지 않는 파일 형식입니다: {file_path.suffix}")
+
+    return file_path
+
+
+def load_input_file(file_path: Path, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    """
+    입력 파일을 읽고, 컬럼명 정규화 및 시간축 생성까지 수행한다.
+
+    반환
+    - df   : 전처리된 DataFrame
+    - meta : 파일 로드 및 시간축 생성 관련 메타정보
+    """
+    # -----------------------------------------------------
+    # 1) 파일 읽기
+    # -----------------------------------------------------
+    if file_path.suffix.lower() == ".csv":
+        df = pd.read_csv(file_path)
+    else:
+        df = pd.read_excel(file_path)
+
+    raw_n_rows = len(df)
+    raw_columns = list(df.columns)
+
+    # -----------------------------------------------------
+    # 2) 컬럼명 정규화
+    # -----------------------------------------------------
+    df = normalize_columns(df)
+
+    # -----------------------------------------------------
+    # 3) 공통 시간축 생성
+    # -----------------------------------------------------
+    df, time_meta = ensure_time_axis(df, cfg)
+
+    # -----------------------------------------------------
+    # 4) 로드 메타정보 정리
+    # -----------------------------------------------------
+    meta = {
+        "input_file": str(file_path),
+        "raw_n_rows": int(raw_n_rows),
+        "processed_n_rows": int(len(df)),
+        "raw_columns": raw_columns,
+        "normalized_columns": list(df.columns),
+        **time_meta,
+    }
+
+    return df, meta
+
+
+# =========================================================
+# 4. Common Utility Functions
+# =========================================================
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    컬럼명을 정규화한다.
+
+    목적
+    - 대소문자 차이 제거
+    - 공백 / 특수문자 차이 완화
+    - 자주 발생하는 컬럼명 변형을 표준명으로 통일
+
+    예
+    - ' Time Local ' -> 'time_local'
+    - 'Depth(m)'     -> 'depth_m'
+    - 'wind speed'   -> 'wind_speed'
+    """
+    original_cols = list(df.columns)
+
+    normalized = []
+    for col in original_cols:
+        c = str(col).strip().lower()
+        c = c.replace(" ", "_")
+        c = c.replace("-", "_")
+        c = c.replace("/", "_")
+        c = c.replace("(", "")
+        c = c.replace(")", "")
+        c = c.replace(".", "_")
+        while "__" in c:
+            c = c.replace("__", "_")
+        normalized.append(c)
+
+    df = df.copy()
+    df.columns = normalized
+
+    # -----------------------------------------------------
+    # 자주 발생하는 별칭을 표준 컬럼명으로 통일
+    # -----------------------------------------------------
+    rename_map = {}
+
+    alias_map = {
+        "time_local": ["time_local", "local_time", "time", "datetime_local"],
+        "epoch_sec": ["epoch_sec", "epoch", "unix_time", "timestamp_sec"],
+        "depth_m": ["depth_m", "depth", "water_level", "level_m", "surface_elevation"],
+        "wind_dir_deg": ["wind_dir_deg", "wind_dir", "wind_direction", "wind_direction_deg"],
+        "wind_speed": ["wind_speed", "wind_speed_ms", "wind_vel", "windspeed"],
+    }
+
+    for standard_name, alias_list in alias_map.items():
+        for alias in alias_list:
+            if alias in df.columns:
+                rename_map[alias] = standard_name
+                break
+
+    df = df.rename(columns=rename_map)
+    return df
+
+
+def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    """
+    분석용 공통 시간축 analysis_time 을 생성한다.
+
+    설계 원칙
+    - 현재 raw 데이터 구조에서는 time_local이 날짜+시각+소수초를 포함하므로
+      이를 주 분석 시간축으로 사용한다.
+    - epoch_sec는 주 시간축으로 사용하지 않고, 보조 검증용으로만 활용한다.
+
+    반환
+    - df
+    - time_meta
+    """
+    df = df.copy()
+
+    # -----------------------------------------------------
+    # 1) 숫자형 컬럼 변환
+    # 수치 연산이 필요한 컬럼은 미리 숫자형으로 변환
+    # -----------------------------------------------------
+    numeric_cols = [cfg.epoch_col, cfg.depth_col, cfg.wind_dir_col, cfg.wind_speed_col]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # -----------------------------------------------------
+    # 2) time_local 필수 확인 및 파싱
+    # -----------------------------------------------------
+    if cfg.time_col not in df.columns:
+        raise KeyError(
+            f"필수 시간 컬럼 '{cfg.time_col}' 이 없습니다. "
+            "현재 데이터 구조에서는 time_local을 주 시간축으로 사용합니다."
+        )
+
+    parsed_time_local = pd.to_datetime(df[cfg.time_col], errors="coerce")
+    valid_ratio = parsed_time_local.notna().mean()
+
+    if valid_ratio <= 0.95:
+        raise ValueError(
+            f"time_local 파싱 실패 비율이 높습니다. "
+            f"(유효 비율: {valid_ratio:.3f})"
+        )
+
+    # analysis_time 생성
+    df["analysis_time"] = parsed_time_local
+
+    # -----------------------------------------------------
+    # 3) analysis_time 결측 제거
+    # -----------------------------------------------------
+    before_drop_na = len(df)
+    df = df.dropna(subset=["analysis_time"]).copy()
+    after_drop_na = len(df)
+
+    # -----------------------------------------------------
+    # 4) 시간순 정렬
+    # -----------------------------------------------------
+    df = df.sort_values("analysis_time").reset_index(drop=True)
+
+    # -----------------------------------------------------
+    # 5) 중복 시간 제거
+    # 동일한 analysis_time이 있으면 첫 행만 유지
+    # -----------------------------------------------------
+    before_drop_dup = len(df)
+    df = df.drop_duplicates(subset=["analysis_time"], keep="first").reset_index(drop=True)
+    after_drop_dup = len(df)
+
+    # -----------------------------------------------------
+    # 6) 필수 컬럼 존재 확인
+    # 현재 단계에서 최소 depth_m 은 반드시 있어야 함
+    # -----------------------------------------------------
+    if cfg.depth_col not in df.columns:
+        raise KeyError(f"필수 컬럼이 없습니다: {cfg.depth_col}")
+
+    # -----------------------------------------------------
+    # 7) epoch_sec 보조 검증
+    # time_local과 epoch_sec가 둘 다 있으면 차이를 계산하여 QA용 정보로 기록
+    # -----------------------------------------------------
+    epoch_check = {
+        "epoch_check_performed": False,
+        "epoch_valid_ratio": None,
+        "epoch_vs_time_local_mean_abs_diff_sec": None,
+        "epoch_vs_time_local_max_abs_diff_sec": None,
+    }
+
+    if cfg.epoch_col in df.columns:
+        epoch_valid_ratio = df[cfg.epoch_col].notna().mean()
+        epoch_check["epoch_valid_ratio"] = float(epoch_valid_ratio)
+
+        if epoch_valid_ratio > 0.95:
+            epoch_time = pd.to_datetime(df[cfg.epoch_col], unit="s", errors="coerce")
+            valid_mask = epoch_time.notna() & df["analysis_time"].notna()
+
+            if valid_mask.any():
+                diff_sec = (
+                    df.loc[valid_mask, "analysis_time"].astype("int64") / 1e9
+                    - epoch_time.loc[valid_mask].astype("int64") / 1e9
+                ).abs()
+
+                epoch_check["epoch_check_performed"] = True
+                epoch_check["epoch_vs_time_local_mean_abs_diff_sec"] = float(diff_sec.mean())
+                epoch_check["epoch_vs_time_local_max_abs_diff_sec"] = float(diff_sec.max())
+
+    # -----------------------------------------------------
+    # 8) 시간축 메타정보 정리
+    # -----------------------------------------------------
+    time_meta = {
+        "time_axis_source": "time_local",
+        "analysis_time_start": str(df["analysis_time"].min()),
+        "analysis_time_end": str(df["analysis_time"].max()),
+        "rows_dropped_due_to_invalid_time": int(before_drop_na - after_drop_na),
+        "rows_dropped_due_to_duplicate_time": int(before_drop_dup - after_drop_dup),
+        **epoch_check,
+    }
+
+    return df, time_meta
+
+
+def make_output_dir(file_path: Path, cfg: Config) -> Path:
+    """
+    입력 파일명 기준으로 출력 폴더를 생성한다.
+
+    예
+    - 입력: C:/data/raw_01.xlsx
+    - 출력: ./outputs/raw_01/
+    """
+    out_root = Path(cfg.output_root)
+    out_dir = out_root / file_path.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def log_meta(results: AnalysisResults, section: str, info: Dict):
+    """
+    각 모듈별 메타정보를 results.meta에 저장한다.
+
+    예
+    - results.meta["load_input"] = {...}
+    - results.meta["timebase_qa"] = {...}
+    """
+    results.meta[section] = info
+
+
+# =========================================================
+# 5. Pre-processing Modules
+# 현재는 골격만 유지. 이후 기능 추가 시 이 함수 내부만 구현.
+# =========================================================
+def run_timebase_qa(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    """
+    시간축 품질 점검 모듈
+
+    향후 구현 예정
+    - 실제 dt 분포 계산
+    - 기대 dt(0.1s) 대비 편차
+    - gap / duplicate / missing 구간 진단
+    - 시간축 품질 메타정보 출력
+    """
+    raise NotImplementedError("run_timebase_qa()는 다음 단계에서 구현 예정입니다.")
+
+
+def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    """
+    depth_m 이상치 제거 모듈
+
+    향후 구현 예정
+    - Hampel filter
+    - rolling MAD 기반 스파이크 제거
+    - 제거 개수 / 비율 기록
+    """
+    raise NotImplementedError("run_depth_qc()는 다음 단계에서 구현 예정입니다.")
+
+
+def run_detrend(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    """
+    기준수면 제거 모듈
+
+    향후 구현 예정
+    - rolling mean
+    - low-frequency trend 제거
+    - eta(수면변위) 생성
+    """
+    raise NotImplementedError("run_detrend()는 다음 단계에서 구현 예정입니다.")
+
+
+# =========================================================
+# 6. Core Analysis Modules
+# 현재는 골격만 유지. 이후 기능 추가 시 이 함수 내부만 구현.
+# =========================================================
+def detect_individual_waves(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    """
+    개별 파 검출 모듈
+
+    향후 구현 예정
+    - zero-upcrossing 기반 개별 파 검출
+    - Hi, Ti, crest, trough 생성
+    """
+    raise NotImplementedError("detect_individual_waves()는 다음 단계에서 구현 예정입니다.")
+
+
+def compute_time_domain_stats(waves_df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    """
+    시간영역 통계 모듈
+
+    향후 구현 예정
+    - Hs
+    - Hmax
+    - Tz
+    - sliding window 통계
+    """
+    raise NotImplementedError("compute_time_domain_stats()는 다음 단계에서 구현 예정입니다.")
+
+
+def compute_spectral_stats(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    """
+    스펙트럼 통계 모듈
+
+    향후 구현 예정
+    - PSD
+    - Hm0
+    - Tp
+    - Tm01 / Tm02
+    """
+    raise NotImplementedError("compute_spectral_stats()는 이후 단계에서 구현 예정입니다.")
+
+
+def compute_swell_partition(spec_df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Sea / Swell 분리 모듈
+
+    향후 구현 예정
+    - 고정 split period 또는 스펙트럼 기반 분리
+    """
+    raise NotImplementedError("compute_swell_partition()는 이후 단계에서 구현 예정입니다.")
+
+
+def compute_ig_metrics(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    """
+    장주기파(IG) 분석 모듈
+
+    향후 구현 예정
+    - IG band energy
+    - Tp_ig
+    - resonance 관련 지표
+    """
+    raise NotImplementedError("compute_ig_metrics()는 이후 단계에서 구현 예정입니다.")
+
+
+def detect_wave_events(td_stats_df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    """
+    이벤트 탐지 모듈
+
+    향후 구현 예정
+    - threshold 초과 구간 탐지
+    - duration / peak / persistence 계산
+    """
+    raise NotImplementedError("detect_wave_events()는 이후 단계에서 구현 예정입니다.")
+
+
+# =========================================================
+# 7. Plot / Save Modules
+# 현재는 metadata 저장만 구현. 표/그래프 저장은 이후 단계에서 확장.
+# =========================================================
+def save_table(df: pd.DataFrame, out_dir: Path, filename: str):
+    """
+    DataFrame을 CSV로 저장한다.
+    """
+    output_path = out_dir / filename
+    df.to_csv(output_path, index=False, encoding="utf-8-sig")
+
+
+def save_meta(results: AnalysisResults, out_dir: Path):
+    """
+    메타정보를 JSON 파일로 저장한다.
+    """
+    output_path = out_dir / "metadata.json"
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(results.meta, f, ensure_ascii=False, indent=2, default=str)
+
+
+def plot_time_domain_stats(td_stats_df: pd.DataFrame, out_dir: Path, cfg: Config):
+    """
+    시간영역 통계 그래프 저장 모듈
+
+    향후 구현 예정
+    - Hs
+    - Hmax
+    - Tz
+    """
+    raise NotImplementedError("plot_time_domain_stats()는 이후 단계에서 구현 예정입니다.")
+
+
+def plot_spectral_stats(spec_df: pd.DataFrame, out_dir: Path, cfg: Config):
+    """
+    스펙트럼 통계 그래프 저장 모듈
+
+    향후 구현 예정
+    - Hm0
+    - Tp
+    """
+    raise NotImplementedError("plot_spectral_stats()는 이후 단계에서 구현 예정입니다.")
+
+
+def plot_swell_stats(swell_df: pd.DataFrame, out_dir: Path, cfg: Config):
+    """
+    Sea / Swell 결과 그래프 저장 모듈
+
+    향후 구현 예정
+    """
+    raise NotImplementedError("plot_swell_stats()는 이후 단계에서 구현 예정입니다.")
+
+
+# =========================================================
+# 8. Pipeline Controller
+# =========================================================
+def run_pipeline(file_path: Path, cfg: Config) -> AnalysisResults:
+    """
+    전체 분석 파이프라인 실행 함수
+
+    현재 단계에서는
+    - 파일 로드
+    - 컬럼 정규화
+    - time_local 기반 시간축 생성
+    - load_input 메타정보 기록
+까지만 수행한다.
+
+    이후 단계에서는 기존 구조를 유지한 채 아래를 순차 추가한다.
+    - run_timebase_qa
+    - run_depth_qc
+    - run_detrend
+    - detect_individual_waves
+    - compute_time_domain_stats
+    - compute_spectral_stats
+    - ...
+    """
+    results = AnalysisResults()
+
+    # -----------------------------------------------------
+    # 1) 입력 파일 로드
+    # -----------------------------------------------------
+    df, load_meta = load_input_file(file_path, cfg)
+    log_meta(results, "load_input", load_meta)
+
+    # -----------------------------------------------------
+    # 2) 이후 단계에서 아래 순서를 그대로 유지하며 기능 추가
+    # 구조를 바꾸지 않고 각 함수 내부만 채워 넣는 것이 원칙
+    # -----------------------------------------------------
+    # if cfg.run_timebase_qa:
+    #     df, meta = run_timebase_qa(df, cfg)
+    #     results.qa = meta
+    #     log_meta(results, "timebase_qa", meta)
+    #
+    # if cfg.run_depth_qc:
+    #     df, meta = run_depth_qc(df, cfg)
+    #     results.qc = meta
+    #     log_meta(results, "depth_qc", meta)
+    #
+    # if cfg.run_detrend:
+    #     df, meta = run_detrend(df, cfg)
+    #     log_meta(results, "detrend", meta)
+    #
+    # if cfg.run_wave_detection:
+    #     waves_df, meta = detect_individual_waves(df, cfg)
+    #     log_meta(results, "wave_detection", meta)
+    #
+    # if cfg.run_time_domain_stats:
+    #     td_df, meta = compute_time_domain_stats(waves_df, cfg)
+    #     results.td_stats = td_df
+    #     log_meta(results, "time_domain_stats", meta)
+
+    return results
+
+
+# =========================================================
+# 9. Main Entry
+# =========================================================
+def main():
+    """
+    프로그램 시작점
+
+    현재 단계 동작
+    - 입력 파일 경로 받기
+    - 출력 폴더 생성
+    - 파일 로드 및 시간축 생성
+    - metadata 저장
+    - 요약 콘솔 출력
+    """
+    cfg = Config()
+
+    try:
+        # 1) 입력 파일 선택
+        file_path = prompt_input_file()
+
+        # 2) 출력 폴더 생성
+        out_dir = make_output_dir(file_path, cfg)
+
+        # 3) 파이프라인 실행
+        results = run_pipeline(file_path, cfg)
+
+        # 4) 메타정보 저장
+        save_meta(results, out_dir)
+
+        # 5) 콘솔 요약 출력
+        load_meta = results.meta.get("load_input", {})
+
+        print("\n[완료]")
+        print(f"- 입력 파일: {file_path}")
+        print(f"- 출력 폴더: {out_dir}")
+        print(f"- 시간축 기준: {load_meta.get('time_axis_source')}")
+        print(f"- 분석 시작 시각: {load_meta.get('analysis_time_start')}")
+        print(f"- 분석 종료 시각: {load_meta.get('analysis_time_end')}")
+        print(f"- 처리 행 수: {load_meta.get('processed_n_rows')}")
+
+        if load_meta.get("epoch_check_performed"):
+            print("- epoch_sec 보조 검증 수행됨")
+            print(f"  · mean abs diff (sec): {load_meta.get('epoch_vs_time_local_mean_abs_diff_sec')}")
+            print(f"  · max  abs diff (sec): {load_meta.get('epoch_vs_time_local_max_abs_diff_sec')}")
+
+        print("- 현재 단계에서는 파일 로드 및 시간축 표준화까지만 수행했습니다.")
+        print("- 다음 단계에서는 run_timebase_qa()를 구현하는 것이 가장 적절합니다.")
+
+    except Exception as e:
+        print("\n[오류 발생]")
+        print(str(e))
+
+
+if __name__ == "__main__":
+    main()
