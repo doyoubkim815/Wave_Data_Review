@@ -297,6 +297,7 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict,
     - time_meta
     """
     df = df.copy()
+    df["raw_row_index"] = df.index
 
     # -----------------------------------------------------
     # 1) 숫자형 컬럼 변환
@@ -329,61 +330,79 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict,
     df["analysis_time"] = parsed_time_local
 
     # -----------------------------------------------------
-    # 3) analysis_time 결측 제거
+    # 3) 처리 제외 규칙 마스크 생성
+    # - invalid_time: analysis_time 파싱 실패
+    # - invalid_depth: depth_m 결측/0.0
+    # - duplicate_time: 유효 시간/유효 depth 대상 중 중복 analysis_time (첫 행 제외)
     # -----------------------------------------------------
     invalid_time_mask = df["analysis_time"].isna()
-    excluded_invalid_time = df.loc[invalid_time_mask].copy()
-    excluded_invalid_time["exclusion_reason"] = "invalid_time"
-    df = df.loc[~invalid_time_mask].copy()
 
-    # -----------------------------------------------------
-    # 4) 시간순 정렬
-    # -----------------------------------------------------
-    df = df.sort_values("analysis_time").reset_index(drop=True)
-
-    # -----------------------------------------------------
-    # 5) 중복 시간 제거
-    # 동일한 analysis_time이 있으면 첫 행만 유지
-    # -----------------------------------------------------
-    duplicate_time_mask = df.duplicated(subset=["analysis_time"], keep="first")
-    excluded_duplicate_time = df.loc[duplicate_time_mask].copy()
-    excluded_duplicate_time["exclusion_reason"] = "duplicate_analysis_time"
-    df = df.loc[~duplicate_time_mask].reset_index(drop=True)
-
-    # -----------------------------------------------------
-    # 6) 필수 컬럼 존재 확인
-    # 현재 단계에서 최소 depth_m 은 반드시 있어야 함
-    # -----------------------------------------------------
     if cfg.depth_col not in df.columns:
         raise KeyError(f"필수 컬럼이 없습니다: {cfg.depth_col}")
-
-    # -----------------------------------------------------
-    # 7) depth_m 유효값 필터링
-    # 계측 누락으로 간주되는 depth_m 결측/0.0 행은 제외
-    # -----------------------------------------------------
     invalid_depth_mask = df[cfg.depth_col].isna() | (df[cfg.depth_col] == 0)
-    excluded_invalid_depth = df.loc[invalid_depth_mask].copy()
-    excluded_invalid_depth["exclusion_reason"] = "invalid_depth_missing_or_zero"
-    df = df.loc[~invalid_depth_mask].reset_index(drop=True)
 
-    excluded_rows_df = pd.concat(
-        [excluded_invalid_time, excluded_duplicate_time, excluded_invalid_depth],
-        ignore_index=True,
+    eligible_for_duplicate = (~invalid_time_mask) & (~invalid_depth_mask)
+    duplicate_time_mask = pd.Series(False, index=df.index)
+
+    dedup_target = df.loc[eligible_for_duplicate].sort_values(
+        by=["analysis_time", "raw_row_index"],
+        kind="mergesort",
+    )
+    duplicated_in_target = dedup_target.duplicated(subset=["analysis_time"], keep="first")
+    duplicate_time_mask.loc[dedup_target.index] = duplicated_in_target
+
+    excluded_mask = invalid_time_mask | invalid_depth_mask | duplicate_time_mask
+
+    # -----------------------------------------------------
+    # 4) 처리 제외 raw 행 구성 (중복 사유 동시 표기)
+    # -----------------------------------------------------
+    excluded_rows_df = df.loc[excluded_mask].copy()
+    excluded_rows_df["excluded_by_invalid_time"] = invalid_time_mask.loc[excluded_rows_df.index]
+    excluded_rows_df["excluded_by_duplicate_time"] = duplicate_time_mask.loc[excluded_rows_df.index]
+    excluded_rows_df["excluded_by_invalid_depth"] = invalid_depth_mask.loc[excluded_rows_df.index]
+
+    def _join_reasons(row) -> str:
+        reasons = []
+        if row["excluded_by_invalid_time"]:
+            reasons.append("invalid_time")
+        if row["excluded_by_duplicate_time"]:
+            reasons.append("duplicate_analysis_time")
+        if row["excluded_by_invalid_depth"]:
+            reasons.append("invalid_depth_missing_or_zero")
+        return ";".join(reasons)
+
+    excluded_rows_df["exclusion_reason"] = excluded_rows_df.apply(_join_reasons, axis=1)
+    excluded_rows_df["exclusion_reason_count"] = (
+        excluded_rows_df[[
+            "excluded_by_invalid_time",
+            "excluded_by_duplicate_time",
+            "excluded_by_invalid_depth",
+        ]].sum(axis=1)
     )
 
     # -----------------------------------------------------
-    # 8) 시간축 메타정보 정리
+    # 5) 유효 데이터만 유지 후 시간순 정렬
     # -----------------------------------------------------
+    df = df.loc[~excluded_mask].copy()
+    df = df.sort_values(by=["analysis_time", "raw_row_index"], kind="mergesort").reset_index(drop=True)
+
+    # -----------------------------------------------------
+    # 6) 시간축 메타정보 정리
+    # -----------------------------------------------------
+    multi_reason_rows = int((excluded_rows_df["exclusion_reason_count"] > 1).sum()) if not excluded_rows_df.empty else 0
+
     time_meta = {
         "time_axis_source": "time_local",
         "analysis_time_start": str(df["analysis_time"].min()),
         "analysis_time_end": str(df["analysis_time"].max()),
-        "rows_dropped_due_to_invalid_time": int(len(excluded_invalid_time)),
-        "rows_dropped_due_to_duplicate_time": int(len(excluded_duplicate_time)),
-        "rows_dropped_due_to_invalid_depth": int(len(excluded_invalid_depth)),
+        "rows_dropped_due_to_invalid_time": int(invalid_time_mask.sum()),
+        "rows_dropped_due_to_duplicate_time": int(duplicate_time_mask.sum()),
+        "rows_dropped_due_to_invalid_depth": int(invalid_depth_mask.sum()),
+        "rows_excluded_total_unique": int(excluded_mask.sum()),
+        "rows_excluded_with_multiple_reasons": multi_reason_rows,
     }
 
-    return df, time_meta, excluded_rows_df
+    return df.drop(columns=["raw_row_index"]), time_meta, excluded_rows_df.reset_index(drop=True)
 
 
 def make_output_dir(file_path: Path, cfg: Config) -> Path:
@@ -562,7 +581,17 @@ def save_excluded_rows_txt(excluded_df: pd.DataFrame, out_dir: Path, filename: s
     if "analysis_time" in export_df.columns:
         export_df["analysis_time"] = export_df["analysis_time"].astype(str)
 
-    preferred_cols = ["analysis_time", "exclusion_reason", "time_local", "depth_m"]
+    preferred_cols = [
+        "raw_row_index",
+        "analysis_time",
+        "exclusion_reason",
+        "exclusion_reason_count",
+        "excluded_by_invalid_time",
+        "excluded_by_duplicate_time",
+        "excluded_by_invalid_depth",
+        "time_local",
+        "depth_m",
+    ]
     existing_preferred = [c for c in preferred_cols if c in export_df.columns]
     remaining_cols = [c for c in export_df.columns if c not in existing_preferred]
     export_df = export_df[existing_preferred + remaining_cols]
@@ -713,14 +742,18 @@ def main():
         dropped_invalid_time = load_meta.get("rows_dropped_due_to_invalid_time", 0)
         dropped_duplicate_time = load_meta.get("rows_dropped_due_to_duplicate_time", 0)
         dropped_invalid_depth = load_meta.get("rows_dropped_due_to_invalid_depth", 0)
+        excluded_unique = load_meta.get("rows_excluded_total_unique", 0)
+        excluded_multi_reason = load_meta.get("rows_excluded_with_multiple_reasons", 0)
 
         if isinstance(raw_n_rows, int) and isinstance(processed_n_rows, int):
             excluded_n_rows = raw_n_rows - processed_n_rows
             print(f"- 처리 제외 행 수(총): {excluded_n_rows}")
+            print(f"- 처리 제외 행 수(고유): {excluded_unique}")
             print("  · 제외 근거(대략):")
             print(f"    - time_local 파싱 실패/결측으로 제외: {dropped_invalid_time}")
             print(f"    - analysis_time 중복으로 제외: {dropped_duplicate_time}")
             print(f"    - depth_m 결측 또는 0.0(미계측)으로 제외: {dropped_invalid_depth}")
+            print(f"    - 복수 사유 동시 해당 행 수: {excluded_multi_reason}")
 
         excluded_txt = load_meta.get("excluded_raw_txt")
         if excluded_txt:
