@@ -447,13 +447,110 @@ def run_timebase_qa(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     """
     시간축 품질 점검 모듈
 
-    향후 구현 예정
-    - 실제 dt 분포 계산
-    - 기대 dt(0.1s) 대비 편차
-    - gap / duplicate / missing 구간 진단
-    - 시간축 품질 메타정보 출력
+    구현 항목
+    - analysis_time 기준 dt_sec 계산
+    - 기대 dt 대비 통계/편차 계산
+    - gap(1.5배 초과) 구간 탐지
+    - 중복 시간 개수 기록
+    - QA 메타정보 반환
     """
-    raise NotImplementedError("run_timebase_qa()는 다음 단계에서 구현 예정입니다.")
+    if "analysis_time" not in df.columns:
+        raise KeyError("run_timebase_qa()를 위해서는 analysis_time 컬럼이 필요합니다.")
+
+    df = df.copy()
+    qa_meta: Dict = {
+        "qa_performed": True,
+        "expected_dt_sec": float(cfg.expected_dt_sec),
+        "n_rows": int(len(df)),
+        "analysis_time_start": str(df["analysis_time"].min()) if len(df) > 0 else None,
+        "analysis_time_end": str(df["analysis_time"].max()) if len(df) > 0 else None,
+    }
+
+    # -----------------------------------------------------
+    # 1) analysis_time 기준 dt_sec 계산
+    # -----------------------------------------------------
+    dt_sec = df["analysis_time"].diff().dt.total_seconds()
+    valid_dt = dt_sec.dropna()
+
+    if len(valid_dt) > 0:
+        dt_median = float(valid_dt.median())
+        dt_mean = float(valid_dt.mean())
+        dt_min = float(valid_dt.min())
+        dt_max = float(valid_dt.max())
+    else:
+        dt_median = None
+        dt_mean = None
+        dt_min = None
+        dt_max = None
+
+    qa_meta.update(
+        {
+            "dt_count": int(len(valid_dt)),
+            "dt_median_sec": dt_median,
+            "dt_mean_sec": dt_mean,
+            "dt_min_sec": dt_min,
+            "dt_max_sec": dt_max,
+        }
+    )
+
+    # -----------------------------------------------------
+    # 2) expected_dt_sec 대비 편차 계산
+    # -----------------------------------------------------
+    if len(valid_dt) > 0:
+        diff_from_expected = valid_dt - float(cfg.expected_dt_sec)
+        abs_diff_from_expected = diff_from_expected.abs()
+
+        qa_meta.update(
+            {
+                "dt_bias_mean_sec": float(diff_from_expected.mean()),
+                "dt_abs_diff_mean_sec": float(abs_diff_from_expected.mean()),
+                "dt_abs_diff_max_sec": float(abs_diff_from_expected.max()),
+            }
+        )
+    else:
+        qa_meta.update(
+            {
+                "dt_bias_mean_sec": None,
+                "dt_abs_diff_mean_sec": None,
+                "dt_abs_diff_max_sec": None,
+            }
+        )
+
+    # -----------------------------------------------------
+    # 3) gap 구간 탐지 (dt > 1.5 * expected_dt_sec)
+    # -----------------------------------------------------
+    gap_threshold = 1.5 * float(cfg.expected_dt_sec)
+    gap_mask = dt_sec > gap_threshold
+    gap_indices = list(df.index[gap_mask])
+
+    gap_segments = []
+    for idx in gap_indices:
+        if idx <= 0:
+            continue
+        gap_segments.append(
+            {
+                "prev_time": str(df.loc[idx - 1, "analysis_time"]),
+                "curr_time": str(df.loc[idx, "analysis_time"]),
+                "gap_dt_sec": float(dt_sec.loc[idx]),
+                "gap_excess_sec": float(dt_sec.loc[idx] - cfg.expected_dt_sec),
+            }
+        )
+
+    qa_meta.update(
+        {
+            "gap_threshold_sec": float(gap_threshold),
+            "n_gap_segments": int(len(gap_segments)),
+            "gap_segments": gap_segments,
+        }
+    )
+
+    # -----------------------------------------------------
+    # 4) 중복 시간 개수 기록
+    # -----------------------------------------------------
+    duplicate_count = int(df["analysis_time"].duplicated(keep=False).sum())
+    qa_meta["duplicate_time_count"] = duplicate_count
+
+    return df, qa_meta
 
 
 def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
@@ -642,10 +739,10 @@ def run_pipeline(file_path: Path, cfg: Config) -> AnalysisResults:
     # 2) 이후 단계에서 아래 순서를 그대로 유지하며 기능 추가
     # 구조를 바꾸지 않고 각 함수 내부만 채워 넣는 것이 원칙
     # -----------------------------------------------------
-    # if cfg.run_timebase_qa:
-    #     df, meta = run_timebase_qa(df, cfg)
-    #     results.qa = meta
-    #     log_meta(results, "timebase_qa", meta)
+    if cfg.run_timebase_qa:
+        df, meta = run_timebase_qa(df, cfg)
+        results.qa = meta
+        log_meta(results, "timebase_qa", meta)
     #
     # if cfg.run_depth_qc:
     #     df, meta = run_depth_qc(df, cfg)
@@ -713,8 +810,15 @@ def main():
             print(f"  · mean abs diff (sec): {load_meta.get('epoch_vs_time_local_mean_abs_diff_sec')}")
             print(f"  · max  abs diff (sec): {load_meta.get('epoch_vs_time_local_max_abs_diff_sec')}")
 
-        print("- 현재 단계에서는 파일 로드 및 시간축 표준화까지만 수행했습니다.")
-        print("- 다음 단계에서는 run_timebase_qa()를 구현하는 것이 가장 적절합니다.")
+        qa_meta = results.meta.get("timebase_qa", {})
+        if qa_meta.get("qa_performed"):
+            print("- 시간축 QA 수행됨")
+            print(f"  · expected dt (sec): {qa_meta.get('expected_dt_sec')}")
+            print(f"  · dt median / mean (sec): {qa_meta.get('dt_median_sec')} / {qa_meta.get('dt_mean_sec')}")
+            print(f"  · dt min / max (sec): {qa_meta.get('dt_min_sec')} / {qa_meta.get('dt_max_sec')}")
+            print(f"  · abs diff mean / max (sec): {qa_meta.get('dt_abs_diff_mean_sec')} / {qa_meta.get('dt_abs_diff_max_sec')}")
+            print(f"  · gap 개수: {qa_meta.get('n_gap_segments')} (threshold={qa_meta.get('gap_threshold_sec')}s)")
+            print(f"  · 중복 시간 개수: {qa_meta.get('duplicate_time_count')}")
 
     except Exception as e:
         print("\n[오류 발생]")
