@@ -87,6 +87,8 @@ class Config:
     output_root: str = "outputs"          # 결과 저장 루트 폴더
     save_csv: bool = True
     save_plot: bool = True
+    save_excluded_raw_txt: bool = True     # 처리 제외 raw 행 텍스트 저장 ON/OFF
+    excluded_raw_txt_name: str = "excluded_raw_rows.txt"
 
 
 # =========================================================
@@ -194,7 +196,7 @@ def prompt_input_file() -> Path:
     return file_path
 
 
-def load_input_file(file_path: Path, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+def load_input_file(file_path: Path, cfg: Config, out_dir: Optional[Path] = None) -> Tuple[pd.DataFrame, Dict]:
     """
     입력 파일을 읽고, 컬럼명 정규화 및 시간축 생성까지 수행한다.
 
@@ -221,7 +223,15 @@ def load_input_file(file_path: Path, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     # -----------------------------------------------------
     # 3) 공통 시간축 생성
     # -----------------------------------------------------
-    df, time_meta = ensure_time_axis(df, cfg)
+    df, time_meta, excluded_rows_df = ensure_time_axis(df, cfg)
+
+    if cfg.save_excluded_raw_txt and out_dir is not None:
+        excluded_txt_path = save_excluded_rows_txt(
+            excluded_rows_df,
+            out_dir,
+            cfg.excluded_raw_txt_name,
+        )
+        time_meta["excluded_raw_txt"] = str(excluded_txt_path)
 
     # -----------------------------------------------------
     # 4) 로드 메타정보 정리
@@ -274,7 +284,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict, pd.DataFrame]:
     """
     분석용 공통 시간축 analysis_time 을 생성한다.
 
@@ -321,9 +331,10 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]
     # -----------------------------------------------------
     # 3) analysis_time 결측 제거
     # -----------------------------------------------------
-    before_drop_na = len(df)
-    df = df.dropna(subset=["analysis_time"]).copy()
-    after_drop_na = len(df)
+    invalid_time_mask = df["analysis_time"].isna()
+    excluded_invalid_time = df.loc[invalid_time_mask].copy()
+    excluded_invalid_time["exclusion_reason"] = "invalid_time"
+    df = df.loc[~invalid_time_mask].copy()
 
     # -----------------------------------------------------
     # 4) 시간순 정렬
@@ -334,9 +345,10 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]
     # 5) 중복 시간 제거
     # 동일한 analysis_time이 있으면 첫 행만 유지
     # -----------------------------------------------------
-    before_drop_dup = len(df)
-    df = df.drop_duplicates(subset=["analysis_time"], keep="first").reset_index(drop=True)
-    after_drop_dup = len(df)
+    duplicate_time_mask = df.duplicated(subset=["analysis_time"], keep="first")
+    excluded_duplicate_time = df.loc[duplicate_time_mask].copy()
+    excluded_duplicate_time["exclusion_reason"] = "duplicate_analysis_time"
+    df = df.loc[~duplicate_time_mask].reset_index(drop=True)
 
     # -----------------------------------------------------
     # 6) 필수 컬럼 존재 확인
@@ -349,10 +361,15 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]
     # 7) depth_m 유효값 필터링
     # 계측 누락으로 간주되는 depth_m 결측/0.0 행은 제외
     # -----------------------------------------------------
-    before_drop_depth_invalid = len(df)
-    valid_depth_mask = df[cfg.depth_col].notna() & (df[cfg.depth_col] != 0)
-    df = df.loc[valid_depth_mask].reset_index(drop=True)
-    after_drop_depth_invalid = len(df)
+    invalid_depth_mask = df[cfg.depth_col].isna() | (df[cfg.depth_col] == 0)
+    excluded_invalid_depth = df.loc[invalid_depth_mask].copy()
+    excluded_invalid_depth["exclusion_reason"] = "invalid_depth_missing_or_zero"
+    df = df.loc[~invalid_depth_mask].reset_index(drop=True)
+
+    excluded_rows_df = pd.concat(
+        [excluded_invalid_time, excluded_duplicate_time, excluded_invalid_depth],
+        ignore_index=True,
+    )
 
     # -----------------------------------------------------
     # 8) 시간축 메타정보 정리
@@ -361,12 +378,12 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]
         "time_axis_source": "time_local",
         "analysis_time_start": str(df["analysis_time"].min()),
         "analysis_time_end": str(df["analysis_time"].max()),
-        "rows_dropped_due_to_invalid_time": int(before_drop_na - after_drop_na),
-        "rows_dropped_due_to_duplicate_time": int(before_drop_dup - after_drop_dup),
-        "rows_dropped_due_to_invalid_depth": int(before_drop_depth_invalid - after_drop_depth_invalid),
+        "rows_dropped_due_to_invalid_time": int(len(excluded_invalid_time)),
+        "rows_dropped_due_to_duplicate_time": int(len(excluded_duplicate_time)),
+        "rows_dropped_due_to_invalid_depth": int(len(excluded_invalid_depth)),
     }
 
-    return df, time_meta
+    return df, time_meta, excluded_rows_df
 
 
 def make_output_dir(file_path: Path, cfg: Config) -> Path:
@@ -530,6 +547,33 @@ def save_meta(results: AnalysisResults, out_dir: Path):
         json.dump(results.meta, f, ensure_ascii=False, indent=2, default=str)
 
 
+def save_excluded_rows_txt(excluded_df: pd.DataFrame, out_dir: Path, filename: str) -> Path:
+    """
+    처리 제외된 raw 행을 텍스트(.txt)로 저장한다.
+    """
+    output_path = out_dir / filename
+
+    if excluded_df.empty:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("[INFO] 처리 제외된 행이 없습니다.\n")
+        return output_path
+
+    export_df = excluded_df.copy()
+    if "analysis_time" in export_df.columns:
+        export_df["analysis_time"] = export_df["analysis_time"].astype(str)
+
+    preferred_cols = ["analysis_time", "exclusion_reason", "time_local", "depth_m"]
+    existing_preferred = [c for c in preferred_cols if c in export_df.columns]
+    remaining_cols = [c for c in export_df.columns if c not in existing_preferred]
+    export_df = export_df[existing_preferred + remaining_cols]
+
+    sort_cols = [c for c in ["analysis_time", "time_local"] if c in export_df.columns]
+    if sort_cols:
+        export_df = export_df.sort_values(by=sort_cols)
+    export_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+    return output_path
+
+
 def plot_time_domain_stats(td_stats_df: pd.DataFrame, out_dir: Path, cfg: Config):
     """
     시간영역 통계 그래프 저장 모듈
@@ -565,7 +609,7 @@ def plot_swell_stats(swell_df: pd.DataFrame, out_dir: Path, cfg: Config):
 # =========================================================
 # 8. Pipeline Controller
 # =========================================================
-def run_pipeline(file_path: Path, cfg: Config) -> AnalysisResults:
+def run_pipeline(file_path: Path, cfg: Config, out_dir: Path) -> AnalysisResults:
     """
     전체 분석 파이프라인 실행 함수
 
@@ -590,7 +634,7 @@ def run_pipeline(file_path: Path, cfg: Config) -> AnalysisResults:
     # -----------------------------------------------------
     # 1) 입력 파일 로드
     # -----------------------------------------------------
-    df, load_meta = load_input_file(file_path, cfg)
+    df, load_meta = load_input_file(file_path, cfg, out_dir)
     log_meta(results, "load_input", load_meta)
 
     # -----------------------------------------------------
@@ -647,7 +691,7 @@ def main():
         out_dir = make_output_dir(file_path, cfg)
 
         # 3) 파이프라인 실행
-        results = run_pipeline(file_path, cfg)
+        results = run_pipeline(file_path, cfg, out_dir)
 
         # 4) 메타정보 저장
         save_meta(results, out_dir)
@@ -677,6 +721,10 @@ def main():
             print(f"    - time_local 파싱 실패/결측으로 제외: {dropped_invalid_time}")
             print(f"    - analysis_time 중복으로 제외: {dropped_duplicate_time}")
             print(f"    - depth_m 결측 또는 0.0(미계측)으로 제외: {dropped_invalid_depth}")
+
+        excluded_txt = load_meta.get("excluded_raw_txt")
+        if excluded_txt:
+            print(f"- 처리 제외 raw 행 파일(.txt): {excluded_txt}")
 
         print("- 현재 단계에서는 파일 로드 및 시간축 표준화까지만 수행했습니다.")
         print("- 다음 단계에서는 run_timebase_qa()를 구현하는 것이 가장 적절합니다.")
