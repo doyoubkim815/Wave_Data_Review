@@ -346,7 +346,16 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]
         raise KeyError(f"필수 컬럼이 없습니다: {cfg.depth_col}")
 
     # -----------------------------------------------------
-    # 7) 시간축 메타정보 정리
+    # 7) depth_m 유효값 필터링
+    # 계측 누락으로 간주되는 depth_m 결측/0.0 행은 제외
+    # -----------------------------------------------------
+    before_drop_depth_invalid = len(df)
+    valid_depth_mask = df[cfg.depth_col].notna() & (df[cfg.depth_col] != 0)
+    df = df.loc[valid_depth_mask].reset_index(drop=True)
+    after_drop_depth_invalid = len(df)
+
+    # -----------------------------------------------------
+    # 8) 시간축 메타정보 정리
     # -----------------------------------------------------
     time_meta = {
         "time_axis_source": "time_local",
@@ -354,6 +363,7 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]
         "analysis_time_end": str(df["analysis_time"].max()),
         "rows_dropped_due_to_invalid_time": int(before_drop_na - after_drop_na),
         "rows_dropped_due_to_duplicate_time": int(before_drop_dup - after_drop_dup),
+        "rows_dropped_due_to_invalid_depth": int(before_drop_depth_invalid - after_drop_depth_invalid),
     }
 
     return df, time_meta
@@ -658,6 +668,7 @@ def main():
         processed_n_rows = load_meta.get("processed_n_rows")
         dropped_invalid_time = load_meta.get("rows_dropped_due_to_invalid_time", 0)
         dropped_duplicate_time = load_meta.get("rows_dropped_due_to_duplicate_time", 0)
+        dropped_invalid_depth = load_meta.get("rows_dropped_due_to_invalid_depth", 0)
 
         if isinstance(raw_n_rows, int) and isinstance(processed_n_rows, int):
             excluded_n_rows = raw_n_rows - processed_n_rows
@@ -665,6 +676,7 @@ def main():
             print("  · 제외 근거(대략):")
             print(f"    - time_local 파싱 실패/결측으로 제외: {dropped_invalid_time}")
             print(f"    - analysis_time 중복으로 제외: {dropped_duplicate_time}")
+            print(f"    - depth_m 결측 또는 0.0(미계측)으로 제외: {dropped_invalid_depth}")
 
         print("- 현재 단계에서는 파일 로드 및 시간축 표준화까지만 수행했습니다.")
         print("- 다음 단계에서는 run_timebase_qa()를 구현하는 것이 가장 적절합니다.")
