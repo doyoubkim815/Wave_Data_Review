@@ -651,7 +651,20 @@ def main():
         print(f"- 시간축 기준: {load_meta.get('time_axis_source')}")
         print(f"- 분석 시작 시각: {load_meta.get('analysis_time_start')}")
         print(f"- 분석 종료 시각: {load_meta.get('analysis_time_end')}")
+        print(f"- 원본 행 수: {load_meta.get('raw_n_rows')}")
         print(f"- 처리 행 수: {load_meta.get('processed_n_rows')}")
+
+        raw_n_rows = load_meta.get("raw_n_rows")
+        processed_n_rows = load_meta.get("processed_n_rows")
+        dropped_invalid_time = load_meta.get("rows_dropped_due_to_invalid_time", 0)
+        dropped_duplicate_time = load_meta.get("rows_dropped_due_to_duplicate_time", 0)
+
+        if isinstance(raw_n_rows, int) and isinstance(processed_n_rows, int):
+            excluded_n_rows = raw_n_rows - processed_n_rows
+            print(f"- 처리 제외 행 수(총): {excluded_n_rows}")
+            print("  · 제외 근거(대략):")
+            print(f"    - time_local 파싱 실패/결측으로 제외: {dropped_invalid_time}")
+            print(f"    - analysis_time 중복으로 제외: {dropped_duplicate_time}")
 
         print("- 현재 단계에서는 파일 로드 및 시간축 표준화까지만 수행했습니다.")
         print("- 다음 단계에서는 run_timebase_qa()를 구현하는 것이 가장 적절합니다.")
