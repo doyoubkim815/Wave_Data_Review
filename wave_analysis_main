@@ -14,9 +14,8 @@
 2) csv / xlsx 파일 읽기
 3) 컬럼명 정규화
 4) time_local 기반 공통 시간축 생성
-5) epoch_sec 보조 검증
-6) 출력 폴더 생성
-7) metadata 저장
+5) 출력 폴더 생성
+6) metadata 저장
 
 향후 추가 예정
 - 시간축 QA (dt, gap, duplicate, missing)
@@ -59,7 +58,6 @@ class Config:
     # 1-1. 입력 파일 표준 컬럼명
     # -----------------------------------------------------
     time_col: str = "time_local"          # 주 분석 시간축 컬럼
-    epoch_col: str = "epoch_sec"          # 보조 검증용 epoch 컬럼
     depth_col: str = "depth_m"            # 수면 높이 또는 수심 계측값
     wind_dir_col: str = "wind_dir_deg"    # 풍향 (현재는 읽기만 함)
     wind_speed_col: str = "wind_speed"    # 풍속 (현재는 읽기만 함)
@@ -250,7 +248,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     목적
     - 대소문자 차이 제거
     - 공백 / 특수문자 차이 완화
-    - 자주 발생하는 컬럼명 변형을 표준명으로 통일
 
     예
     - ' Time Local ' -> 'time_local'
@@ -274,27 +271,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
     df.columns = normalized
-
-    # -----------------------------------------------------
-    # 자주 발생하는 별칭을 표준 컬럼명으로 통일
-    # -----------------------------------------------------
-    rename_map = {}
-
-    alias_map = {
-        "time_local": ["time_local", "local_time", "time", "datetime_local"],
-        "epoch_sec": ["epoch_sec", "epoch", "unix_time", "timestamp_sec"],
-        "depth_m": ["depth_m", "depth", "water_level", "level_m", "surface_elevation"],
-        "wind_dir_deg": ["wind_dir_deg", "wind_dir", "wind_direction", "wind_direction_deg"],
-        "wind_speed": ["wind_speed", "wind_speed_ms", "wind_vel", "windspeed"],
-    }
-
-    for standard_name, alias_list in alias_map.items():
-        for alias in alias_list:
-            if alias in df.columns:
-                rename_map[alias] = standard_name
-                break
-
-    df = df.rename(columns=rename_map)
     return df
 
 
@@ -305,7 +281,6 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]
     설계 원칙
     - 현재 raw 데이터 구조에서는 time_local이 날짜+시각+소수초를 포함하므로
       이를 주 분석 시간축으로 사용한다.
-    - epoch_sec는 주 시간축으로 사용하지 않고, 보조 검증용으로만 활용한다.
 
     반환
     - df
@@ -317,7 +292,7 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]
     # 1) 숫자형 컬럼 변환
     # 수치 연산이 필요한 컬럼은 미리 숫자형으로 변환
     # -----------------------------------------------------
-    numeric_cols = [cfg.epoch_col, cfg.depth_col, cfg.wind_dir_col, cfg.wind_speed_col]
+    numeric_cols = [cfg.depth_col, cfg.wind_dir_col, cfg.wind_speed_col]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -371,36 +346,7 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]
         raise KeyError(f"필수 컬럼이 없습니다: {cfg.depth_col}")
 
     # -----------------------------------------------------
-    # 7) epoch_sec 보조 검증
-    # time_local과 epoch_sec가 둘 다 있으면 차이를 계산하여 QA용 정보로 기록
-    # -----------------------------------------------------
-    epoch_check = {
-        "epoch_check_performed": False,
-        "epoch_valid_ratio": None,
-        "epoch_vs_time_local_mean_abs_diff_sec": None,
-        "epoch_vs_time_local_max_abs_diff_sec": None,
-    }
-
-    if cfg.epoch_col in df.columns:
-        epoch_valid_ratio = df[cfg.epoch_col].notna().mean()
-        epoch_check["epoch_valid_ratio"] = float(epoch_valid_ratio)
-
-        if epoch_valid_ratio > 0.95:
-            epoch_time = pd.to_datetime(df[cfg.epoch_col], unit="s", errors="coerce")
-            valid_mask = epoch_time.notna() & df["analysis_time"].notna()
-
-            if valid_mask.any():
-                diff_sec = (
-                    df.loc[valid_mask, "analysis_time"].astype("int64") / 1e9
-                    - epoch_time.loc[valid_mask].astype("int64") / 1e9
-                ).abs()
-
-                epoch_check["epoch_check_performed"] = True
-                epoch_check["epoch_vs_time_local_mean_abs_diff_sec"] = float(diff_sec.mean())
-                epoch_check["epoch_vs_time_local_max_abs_diff_sec"] = float(diff_sec.max())
-
-    # -----------------------------------------------------
-    # 8) 시간축 메타정보 정리
+    # 7) 시간축 메타정보 정리
     # -----------------------------------------------------
     time_meta = {
         "time_axis_source": "time_local",
@@ -408,7 +354,6 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]
         "analysis_time_end": str(df["analysis_time"].max()),
         "rows_dropped_due_to_invalid_time": int(before_drop_na - after_drop_na),
         "rows_dropped_due_to_duplicate_time": int(before_drop_dup - after_drop_dup),
-        **epoch_check,
     }
 
     return df, time_meta
@@ -707,11 +652,6 @@ def main():
         print(f"- 분석 시작 시각: {load_meta.get('analysis_time_start')}")
         print(f"- 분석 종료 시각: {load_meta.get('analysis_time_end')}")
         print(f"- 처리 행 수: {load_meta.get('processed_n_rows')}")
-
-        if load_meta.get("epoch_check_performed"):
-            print("- epoch_sec 보조 검증 수행됨")
-            print(f"  · mean abs diff (sec): {load_meta.get('epoch_vs_time_local_mean_abs_diff_sec')}")
-            print(f"  · max  abs diff (sec): {load_meta.get('epoch_vs_time_local_max_abs_diff_sec')}")
 
         print("- 현재 단계에서는 파일 로드 및 시간축 표준화까지만 수행했습니다.")
         print("- 다음 단계에서는 run_timebase_qa()를 구현하는 것이 가장 적절합니다.")
