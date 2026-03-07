@@ -14,9 +14,8 @@
 2) csv / xlsx 파일 읽기
 3) 컬럼명 정규화
 4) time_local 기반 공통 시간축 생성
-5) epoch_sec 보조 검증
-6) 출력 폴더 생성
-7) metadata 저장
+5) 출력 폴더 생성
+6) metadata 저장
 
 향후 추가 예정
 - 시간축 QA (dt, gap, duplicate, missing)
@@ -59,7 +58,6 @@ class Config:
     # 1-1. 입력 파일 표준 컬럼명
     # -----------------------------------------------------
     time_col: str = "time_local"          # 주 분석 시간축 컬럼
-    epoch_col: str = "epoch_sec"          # 보조 검증용 epoch 컬럼
     depth_col: str = "depth_m"            # 수면 높이 또는 수심 계측값
     wind_dir_col: str = "wind_dir_deg"    # 풍향 (현재는 읽기만 함)
     wind_speed_col: str = "wind_speed"    # 풍속 (현재는 읽기만 함)
@@ -89,6 +87,8 @@ class Config:
     output_root: str = "outputs"          # 결과 저장 루트 폴더
     save_csv: bool = True
     save_plot: bool = True
+    save_excluded_raw_txt: bool = True     # 처리 제외 raw 행 텍스트 저장 ON/OFF
+    excluded_raw_txt_name: str = "excluded_raw_rows.txt"
 
 
 # =========================================================
@@ -196,7 +196,7 @@ def prompt_input_file() -> Path:
     return file_path
 
 
-def load_input_file(file_path: Path, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+def load_input_file(file_path: Path, cfg: Config, out_dir: Optional[Path] = None) -> Tuple[pd.DataFrame, Dict]:
     """
     입력 파일을 읽고, 컬럼명 정규화 및 시간축 생성까지 수행한다.
 
@@ -223,7 +223,15 @@ def load_input_file(file_path: Path, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     # -----------------------------------------------------
     # 3) 공통 시간축 생성
     # -----------------------------------------------------
-    df, time_meta = ensure_time_axis(df, cfg)
+    df, time_meta, excluded_rows_df = ensure_time_axis(df, cfg)
+
+    if cfg.save_excluded_raw_txt and out_dir is not None:
+        excluded_txt_path = save_excluded_rows_txt(
+            excluded_rows_df,
+            out_dir,
+            cfg.excluded_raw_txt_name,
+        )
+        time_meta["excluded_raw_txt"] = str(excluded_txt_path)
 
     # -----------------------------------------------------
     # 4) 로드 메타정보 정리
@@ -250,7 +258,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     목적
     - 대소문자 차이 제거
     - 공백 / 특수문자 차이 완화
-    - 자주 발생하는 컬럼명 변형을 표준명으로 통일
 
     예
     - ' Time Local ' -> 'time_local'
@@ -274,50 +281,29 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
     df.columns = normalized
-
-    # -----------------------------------------------------
-    # 자주 발생하는 별칭을 표준 컬럼명으로 통일
-    # -----------------------------------------------------
-    rename_map = {}
-
-    alias_map = {
-        "time_local": ["time_local", "local_time", "time", "datetime_local"],
-        "epoch_sec": ["epoch_sec", "epoch", "unix_time", "timestamp_sec"],
-        "depth_m": ["depth_m", "depth", "water_level", "level_m", "surface_elevation"],
-        "wind_dir_deg": ["wind_dir_deg", "wind_dir", "wind_direction", "wind_direction_deg"],
-        "wind_speed": ["wind_speed", "wind_speed_ms", "wind_vel", "windspeed"],
-    }
-
-    for standard_name, alias_list in alias_map.items():
-        for alias in alias_list:
-            if alias in df.columns:
-                rename_map[alias] = standard_name
-                break
-
-    df = df.rename(columns=rename_map)
     return df
 
 
-def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict, pd.DataFrame]:
     """
     분석용 공통 시간축 analysis_time 을 생성한다.
 
     설계 원칙
     - 현재 raw 데이터 구조에서는 time_local이 날짜+시각+소수초를 포함하므로
       이를 주 분석 시간축으로 사용한다.
-    - epoch_sec는 주 시간축으로 사용하지 않고, 보조 검증용으로만 활용한다.
 
     반환
     - df
     - time_meta
     """
     df = df.copy()
+    df["raw_row_index"] = df.index
 
     # -----------------------------------------------------
     # 1) 숫자형 컬럼 변환
     # 수치 연산이 필요한 컬럼은 미리 숫자형으로 변환
     # -----------------------------------------------------
-    numeric_cols = [cfg.epoch_col, cfg.depth_col, cfg.wind_dir_col, cfg.wind_speed_col]
+    numeric_cols = [cfg.depth_col, cfg.wind_dir_col, cfg.wind_speed_col]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -344,74 +330,79 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]
     df["analysis_time"] = parsed_time_local
 
     # -----------------------------------------------------
-    # 3) analysis_time 결측 제거
+    # 3) 처리 제외 규칙 마스크 생성
+    # - invalid_time: analysis_time 파싱 실패
+    # - invalid_depth: depth_m 결측/0.0
+    # - duplicate_time: 유효 시간/유효 depth 대상 중 중복 analysis_time (첫 행 제외)
     # -----------------------------------------------------
-    before_drop_na = len(df)
-    df = df.dropna(subset=["analysis_time"]).copy()
-    after_drop_na = len(df)
+    invalid_time_mask = df["analysis_time"].isna()
 
-    # -----------------------------------------------------
-    # 4) 시간순 정렬
-    # -----------------------------------------------------
-    df = df.sort_values("analysis_time").reset_index(drop=True)
-
-    # -----------------------------------------------------
-    # 5) 중복 시간 제거
-    # 동일한 analysis_time이 있으면 첫 행만 유지
-    # -----------------------------------------------------
-    before_drop_dup = len(df)
-    df = df.drop_duplicates(subset=["analysis_time"], keep="first").reset_index(drop=True)
-    after_drop_dup = len(df)
-
-    # -----------------------------------------------------
-    # 6) 필수 컬럼 존재 확인
-    # 현재 단계에서 최소 depth_m 은 반드시 있어야 함
-    # -----------------------------------------------------
     if cfg.depth_col not in df.columns:
         raise KeyError(f"필수 컬럼이 없습니다: {cfg.depth_col}")
+    invalid_depth_mask = df[cfg.depth_col].isna() | (df[cfg.depth_col] == 0)
+
+    eligible_for_duplicate = (~invalid_time_mask) & (~invalid_depth_mask)
+    duplicate_time_mask = pd.Series(False, index=df.index)
+
+    dedup_target = df.loc[eligible_for_duplicate].sort_values(
+        by=["analysis_time", "raw_row_index"],
+        kind="mergesort",
+    )
+    duplicated_in_target = dedup_target.duplicated(subset=["analysis_time"], keep="first")
+    duplicate_time_mask.loc[dedup_target.index] = duplicated_in_target
+
+    excluded_mask = invalid_time_mask | invalid_depth_mask | duplicate_time_mask
 
     # -----------------------------------------------------
-    # 7) epoch_sec 보조 검증
-    # time_local과 epoch_sec가 둘 다 있으면 차이를 계산하여 QA용 정보로 기록
+    # 4) 처리 제외 raw 행 구성 (중복 사유 동시 표기)
     # -----------------------------------------------------
-    epoch_check = {
-        "epoch_check_performed": False,
-        "epoch_valid_ratio": None,
-        "epoch_vs_time_local_mean_abs_diff_sec": None,
-        "epoch_vs_time_local_max_abs_diff_sec": None,
-    }
+    excluded_rows_df = df.loc[excluded_mask].copy()
+    excluded_rows_df["excluded_by_invalid_time"] = invalid_time_mask.loc[excluded_rows_df.index]
+    excluded_rows_df["excluded_by_duplicate_time"] = duplicate_time_mask.loc[excluded_rows_df.index]
+    excluded_rows_df["excluded_by_invalid_depth"] = invalid_depth_mask.loc[excluded_rows_df.index]
 
-    if cfg.epoch_col in df.columns:
-        epoch_valid_ratio = df[cfg.epoch_col].notna().mean()
-        epoch_check["epoch_valid_ratio"] = float(epoch_valid_ratio)
+    def _join_reasons(row) -> str:
+        reasons = []
+        if row["excluded_by_invalid_time"]:
+            reasons.append("invalid_time")
+        if row["excluded_by_duplicate_time"]:
+            reasons.append("duplicate_analysis_time")
+        if row["excluded_by_invalid_depth"]:
+            reasons.append("invalid_depth_missing_or_zero")
+        return ";".join(reasons)
 
-        if epoch_valid_ratio > 0.95:
-            epoch_time = pd.to_datetime(df[cfg.epoch_col], unit="s", errors="coerce")
-            valid_mask = epoch_time.notna() & df["analysis_time"].notna()
-
-            if valid_mask.any():
-                diff_sec = (
-                    df.loc[valid_mask, "analysis_time"].astype("int64") / 1e9
-                    - epoch_time.loc[valid_mask].astype("int64") / 1e9
-                ).abs()
-
-                epoch_check["epoch_check_performed"] = True
-                epoch_check["epoch_vs_time_local_mean_abs_diff_sec"] = float(diff_sec.mean())
-                epoch_check["epoch_vs_time_local_max_abs_diff_sec"] = float(diff_sec.max())
+    excluded_rows_df["exclusion_reason"] = excluded_rows_df.apply(_join_reasons, axis=1)
+    excluded_rows_df["exclusion_reason_count"] = (
+        excluded_rows_df[[
+            "excluded_by_invalid_time",
+            "excluded_by_duplicate_time",
+            "excluded_by_invalid_depth",
+        ]].sum(axis=1)
+    )
 
     # -----------------------------------------------------
-    # 8) 시간축 메타정보 정리
+    # 5) 유효 데이터만 유지 후 시간순 정렬
     # -----------------------------------------------------
+    df = df.loc[~excluded_mask].copy()
+    df = df.sort_values(by=["analysis_time", "raw_row_index"], kind="mergesort").reset_index(drop=True)
+
+    # -----------------------------------------------------
+    # 6) 시간축 메타정보 정리
+    # -----------------------------------------------------
+    multi_reason_rows = int((excluded_rows_df["exclusion_reason_count"] > 1).sum()) if not excluded_rows_df.empty else 0
+
     time_meta = {
         "time_axis_source": "time_local",
         "analysis_time_start": str(df["analysis_time"].min()),
         "analysis_time_end": str(df["analysis_time"].max()),
-        "rows_dropped_due_to_invalid_time": int(before_drop_na - after_drop_na),
-        "rows_dropped_due_to_duplicate_time": int(before_drop_dup - after_drop_dup),
-        **epoch_check,
+        "rows_dropped_due_to_invalid_time": int(invalid_time_mask.sum()),
+        "rows_dropped_due_to_duplicate_time": int(duplicate_time_mask.sum()),
+        "rows_dropped_due_to_invalid_depth": int(invalid_depth_mask.sum()),
+        "rows_excluded_total_unique": int(excluded_mask.sum()),
+        "rows_excluded_with_multiple_reasons": multi_reason_rows,
     }
 
-    return df, time_meta
+    return df.drop(columns=["raw_row_index"]), time_meta, excluded_rows_df.reset_index(drop=True)
 
 
 def make_output_dir(file_path: Path, cfg: Config) -> Path:
@@ -447,13 +438,71 @@ def run_timebase_qa(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     """
     시간축 품질 점검 모듈
 
-    향후 구현 예정
+    현재 구현
     - 실제 dt 분포 계산
     - 기대 dt(0.1s) 대비 편차
     - gap / duplicate / missing 구간 진단
     - 시간축 품질 메타정보 출력
     """
-    raise NotImplementedError("run_timebase_qa()는 다음 단계에서 구현 예정입니다.")
+    if "analysis_time" not in df.columns:
+        raise KeyError("run_timebase_qa() 실행을 위해 'analysis_time' 컬럼이 필요합니다.")
+
+    qa_meta = {
+        "expected_dt_sec": float(cfg.expected_dt_sec),
+        "n_rows": int(len(df)),
+        "n_intervals": 0,
+        "dt_mean_sec": None,
+        "dt_std_sec": None,
+        "dt_min_sec": None,
+        "dt_q05_sec": None,
+        "dt_median_sec": None,
+        "dt_q95_sec": None,
+        "dt_max_sec": None,
+        "n_duplicate_or_non_increasing": 0,
+        "n_gap_intervals": 0,
+        "estimated_missing_samples": 0,
+        "n_large_dt_deviation": 0,
+    }
+
+    if len(df) < 2:
+        return df, qa_meta
+
+    # -----------------------------------------------------
+    # 1) dt 계산
+    # -----------------------------------------------------
+    work = df[["analysis_time"]].sort_values("analysis_time").reset_index(drop=True)
+    dt_sec = work["analysis_time"].diff().dt.total_seconds().dropna()
+
+    qa_meta["n_intervals"] = int(len(dt_sec))
+
+    # -----------------------------------------------------
+    # 2) dt 분포 요약 통계
+    # -----------------------------------------------------
+    qa_meta["dt_mean_sec"] = float(dt_sec.mean())
+    qa_meta["dt_std_sec"] = float(dt_sec.std(ddof=0))
+    qa_meta["dt_min_sec"] = float(dt_sec.min())
+    qa_meta["dt_q05_sec"] = float(dt_sec.quantile(0.05))
+    qa_meta["dt_median_sec"] = float(dt_sec.median())
+    qa_meta["dt_q95_sec"] = float(dt_sec.quantile(0.95))
+    qa_meta["dt_max_sec"] = float(dt_sec.max())
+
+    # -----------------------------------------------------
+    # 3) gap / duplicate / missing 진단
+    # -----------------------------------------------------
+    expected_dt = float(cfg.expected_dt_sec)
+    non_increasing_mask = dt_sec <= 0
+    gap_mask = dt_sec > expected_dt * 1.5
+    large_deviation_mask = (dt_sec - expected_dt).abs() > expected_dt * 0.5
+
+    qa_meta["n_duplicate_or_non_increasing"] = int(non_increasing_mask.sum())
+    qa_meta["n_gap_intervals"] = int(gap_mask.sum())
+    qa_meta["n_large_dt_deviation"] = int(large_deviation_mask.sum())
+
+    if expected_dt > 0:
+        estimated_missing = ((dt_sec[gap_mask] / expected_dt).round() - 1).clip(lower=0).sum()
+        qa_meta["estimated_missing_samples"] = int(estimated_missing)
+
+    return df, qa_meta
 
 
 def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
@@ -575,6 +624,43 @@ def save_meta(results: AnalysisResults, out_dir: Path):
         json.dump(results.meta, f, ensure_ascii=False, indent=2, default=str)
 
 
+def save_excluded_rows_txt(excluded_df: pd.DataFrame, out_dir: Path, filename: str) -> Path:
+    """
+    처리 제외된 raw 행을 텍스트(.txt)로 저장한다.
+    """
+    output_path = out_dir / filename
+
+    if excluded_df.empty:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("[INFO] 처리 제외된 행이 없습니다.\n")
+        return output_path
+
+    export_df = excluded_df.copy()
+    if "analysis_time" in export_df.columns:
+        export_df["analysis_time"] = export_df["analysis_time"].astype(str)
+
+    preferred_cols = [
+        "raw_row_index",
+        "analysis_time",
+        "exclusion_reason",
+        "exclusion_reason_count",
+        "excluded_by_invalid_time",
+        "excluded_by_duplicate_time",
+        "excluded_by_invalid_depth",
+        "time_local",
+        "depth_m",
+    ]
+    existing_preferred = [c for c in preferred_cols if c in export_df.columns]
+    remaining_cols = [c for c in export_df.columns if c not in existing_preferred]
+    export_df = export_df[existing_preferred + remaining_cols]
+
+    sort_cols = [c for c in ["analysis_time", "time_local"] if c in export_df.columns]
+    if sort_cols:
+        export_df = export_df.sort_values(by=sort_cols)
+    export_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+    return output_path
+
+
 def plot_time_domain_stats(td_stats_df: pd.DataFrame, out_dir: Path, cfg: Config):
     """
     시간영역 통계 그래프 저장 모듈
@@ -610,7 +696,7 @@ def plot_swell_stats(swell_df: pd.DataFrame, out_dir: Path, cfg: Config):
 # =========================================================
 # 8. Pipeline Controller
 # =========================================================
-def run_pipeline(file_path: Path, cfg: Config) -> AnalysisResults:
+def run_pipeline(file_path: Path, cfg: Config, out_dir: Path) -> AnalysisResults:
     """
     전체 분석 파이프라인 실행 함수
 
@@ -635,18 +721,18 @@ def run_pipeline(file_path: Path, cfg: Config) -> AnalysisResults:
     # -----------------------------------------------------
     # 1) 입력 파일 로드
     # -----------------------------------------------------
-    df, load_meta = load_input_file(file_path, cfg)
+    df, load_meta = load_input_file(file_path, cfg, out_dir)
     log_meta(results, "load_input", load_meta)
 
     # -----------------------------------------------------
     # 2) 이후 단계에서 아래 순서를 그대로 유지하며 기능 추가
     # 구조를 바꾸지 않고 각 함수 내부만 채워 넣는 것이 원칙
     # -----------------------------------------------------
-    # if cfg.run_timebase_qa:
-    #     df, meta = run_timebase_qa(df, cfg)
-    #     results.qa = meta
-    #     log_meta(results, "timebase_qa", meta)
-    #
+    if cfg.run_timebase_qa:
+        df, meta = run_timebase_qa(df, cfg)
+        results.qa = meta
+        log_meta(results, "timebase_qa", meta)
+
     # if cfg.run_depth_qc:
     #     df, meta = run_depth_qc(df, cfg)
     #     results.qc = meta
@@ -692,7 +778,7 @@ def main():
         out_dir = make_output_dir(file_path, cfg)
 
         # 3) 파이프라인 실행
-        results = run_pipeline(file_path, cfg)
+        results = run_pipeline(file_path, cfg, out_dir)
 
         # 4) 메타정보 저장
         save_meta(results, out_dir)
@@ -706,15 +792,33 @@ def main():
         print(f"- 시간축 기준: {load_meta.get('time_axis_source')}")
         print(f"- 분석 시작 시각: {load_meta.get('analysis_time_start')}")
         print(f"- 분석 종료 시각: {load_meta.get('analysis_time_end')}")
+        print(f"- 원본 행 수: {load_meta.get('raw_n_rows')}")
         print(f"- 처리 행 수: {load_meta.get('processed_n_rows')}")
 
-        if load_meta.get("epoch_check_performed"):
-            print("- epoch_sec 보조 검증 수행됨")
-            print(f"  · mean abs diff (sec): {load_meta.get('epoch_vs_time_local_mean_abs_diff_sec')}")
-            print(f"  · max  abs diff (sec): {load_meta.get('epoch_vs_time_local_max_abs_diff_sec')}")
+        raw_n_rows = load_meta.get("raw_n_rows")
+        processed_n_rows = load_meta.get("processed_n_rows")
+        dropped_invalid_time = load_meta.get("rows_dropped_due_to_invalid_time", 0)
+        dropped_duplicate_time = load_meta.get("rows_dropped_due_to_duplicate_time", 0)
+        dropped_invalid_depth = load_meta.get("rows_dropped_due_to_invalid_depth", 0)
+        excluded_unique = load_meta.get("rows_excluded_total_unique", 0)
+        excluded_multi_reason = load_meta.get("rows_excluded_with_multiple_reasons", 0)
 
-        print("- 현재 단계에서는 파일 로드 및 시간축 표준화까지만 수행했습니다.")
-        print("- 다음 단계에서는 run_timebase_qa()를 구현하는 것이 가장 적절합니다.")
+        if isinstance(raw_n_rows, int) and isinstance(processed_n_rows, int):
+            excluded_n_rows = raw_n_rows - processed_n_rows
+            print(f"- 처리 제외 행 수(총): {excluded_n_rows}")
+            print(f"- 처리 제외 행 수(고유): {excluded_unique}")
+            print("  · 제외 근거(대략):")
+            print(f"    - time_local 파싱 실패/결측으로 제외: {dropped_invalid_time}")
+            print(f"    - analysis_time 중복으로 제외: {dropped_duplicate_time}")
+            print(f"    - depth_m 결측 또는 0.0(미계측)으로 제외: {dropped_invalid_depth}")
+            print(f"    - 복수 사유 동시 해당 행 수: {excluded_multi_reason}")
+
+        excluded_txt = load_meta.get("excluded_raw_txt")
+        if excluded_txt:
+            print(f"- 처리 제외 raw 행 파일(.txt): {excluded_txt}")
+
+        print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa까지 수행했습니다.")
+        print("- 다음 단계에서는 run_depth_qc()를 구현하는 것이 가장 적절합니다.")
 
     except Exception as e:
         print("\n[오류 발생]")
