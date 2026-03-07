@@ -438,13 +438,71 @@ def run_timebase_qa(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     """
     시간축 품질 점검 모듈
 
-    향후 구현 예정
+    현재 구현
     - 실제 dt 분포 계산
     - 기대 dt(0.1s) 대비 편차
     - gap / duplicate / missing 구간 진단
     - 시간축 품질 메타정보 출력
     """
-    raise NotImplementedError("run_timebase_qa()는 다음 단계에서 구현 예정입니다.")
+    if "analysis_time" not in df.columns:
+        raise KeyError("run_timebase_qa() 실행을 위해 'analysis_time' 컬럼이 필요합니다.")
+
+    qa_meta = {
+        "expected_dt_sec": float(cfg.expected_dt_sec),
+        "n_rows": int(len(df)),
+        "n_intervals": 0,
+        "dt_mean_sec": None,
+        "dt_std_sec": None,
+        "dt_min_sec": None,
+        "dt_q05_sec": None,
+        "dt_median_sec": None,
+        "dt_q95_sec": None,
+        "dt_max_sec": None,
+        "n_duplicate_or_non_increasing": 0,
+        "n_gap_intervals": 0,
+        "estimated_missing_samples": 0,
+        "n_large_dt_deviation": 0,
+    }
+
+    if len(df) < 2:
+        return df, qa_meta
+
+    # -----------------------------------------------------
+    # 1) dt 계산
+    # -----------------------------------------------------
+    work = df[["analysis_time"]].sort_values("analysis_time").reset_index(drop=True)
+    dt_sec = work["analysis_time"].diff().dt.total_seconds().dropna()
+
+    qa_meta["n_intervals"] = int(len(dt_sec))
+
+    # -----------------------------------------------------
+    # 2) dt 분포 요약 통계
+    # -----------------------------------------------------
+    qa_meta["dt_mean_sec"] = float(dt_sec.mean())
+    qa_meta["dt_std_sec"] = float(dt_sec.std(ddof=0))
+    qa_meta["dt_min_sec"] = float(dt_sec.min())
+    qa_meta["dt_q05_sec"] = float(dt_sec.quantile(0.05))
+    qa_meta["dt_median_sec"] = float(dt_sec.median())
+    qa_meta["dt_q95_sec"] = float(dt_sec.quantile(0.95))
+    qa_meta["dt_max_sec"] = float(dt_sec.max())
+
+    # -----------------------------------------------------
+    # 3) gap / duplicate / missing 진단
+    # -----------------------------------------------------
+    expected_dt = float(cfg.expected_dt_sec)
+    non_increasing_mask = dt_sec <= 0
+    gap_mask = dt_sec > expected_dt * 1.5
+    large_deviation_mask = (dt_sec - expected_dt).abs() > expected_dt * 0.5
+
+    qa_meta["n_duplicate_or_non_increasing"] = int(non_increasing_mask.sum())
+    qa_meta["n_gap_intervals"] = int(gap_mask.sum())
+    qa_meta["n_large_dt_deviation"] = int(large_deviation_mask.sum())
+
+    if expected_dt > 0:
+        estimated_missing = ((dt_sec[gap_mask] / expected_dt).round() - 1).clip(lower=0).sum()
+        qa_meta["estimated_missing_samples"] = int(estimated_missing)
+
+    return df, qa_meta
 
 
 def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
@@ -670,11 +728,11 @@ def run_pipeline(file_path: Path, cfg: Config, out_dir: Path) -> AnalysisResults
     # 2) 이후 단계에서 아래 순서를 그대로 유지하며 기능 추가
     # 구조를 바꾸지 않고 각 함수 내부만 채워 넣는 것이 원칙
     # -----------------------------------------------------
-    # if cfg.run_timebase_qa:
-    #     df, meta = run_timebase_qa(df, cfg)
-    #     results.qa = meta
-    #     log_meta(results, "timebase_qa", meta)
-    #
+    if cfg.run_timebase_qa:
+        df, meta = run_timebase_qa(df, cfg)
+        results.qa = meta
+        log_meta(results, "timebase_qa", meta)
+
     # if cfg.run_depth_qc:
     #     df, meta = run_depth_qc(df, cfg)
     #     results.qc = meta
@@ -759,8 +817,8 @@ def main():
         if excluded_txt:
             print(f"- 처리 제외 raw 행 파일(.txt): {excluded_txt}")
 
-        print("- 현재 단계에서는 파일 로드 및 시간축 표준화까지만 수행했습니다.")
-        print("- 다음 단계에서는 run_timebase_qa()를 구현하는 것이 가장 적절합니다.")
+        print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa까지 수행했습니다.")
+        print("- 다음 단계에서는 run_depth_qc()를 구현하는 것이 가장 적절합니다.")
 
     except Exception as e:
         print("\n[오류 발생]")
