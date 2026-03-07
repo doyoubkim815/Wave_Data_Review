@@ -458,8 +458,12 @@ def run_timebase_qa(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
         "dt_median_sec": None,
         "dt_q95_sec": None,
         "dt_max_sec": None,
-        "n_duplicate_or_non_increasing": 0,
+        "dt_abs_diff_mean_sec": None,
+        "dt_abs_diff_max_sec": None,
+        "n_duplicate_intervals": 0,
+        "n_non_increasing_intervals": 0,
         "n_gap_intervals": 0,
+        "gap_intervals": [],
         "estimated_missing_samples": 0,
         "n_large_dt_deviation": 0,
     }
@@ -471,7 +475,8 @@ def run_timebase_qa(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     # 1) dt 계산
     # -----------------------------------------------------
     work = df[["analysis_time"]].sort_values("analysis_time").reset_index(drop=True)
-    dt_sec = work["analysis_time"].diff().dt.total_seconds().dropna()
+    dt_series = work["analysis_time"].diff().dt.total_seconds()
+    dt_sec = dt_series.dropna()
 
     qa_meta["n_intervals"] = int(len(dt_sec))
 
@@ -487,16 +492,37 @@ def run_timebase_qa(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     qa_meta["dt_max_sec"] = float(dt_sec.max())
 
     # -----------------------------------------------------
-    # 3) gap / duplicate / missing 진단
+    # 3) expected_dt 대비 편차 통계
     # -----------------------------------------------------
     expected_dt = float(cfg.expected_dt_sec)
+    abs_diff = (dt_sec - expected_dt).abs()
+    qa_meta["dt_abs_diff_mean_sec"] = float(abs_diff.mean())
+    qa_meta["dt_abs_diff_max_sec"] = float(abs_diff.max())
+
+    # -----------------------------------------------------
+    # 4) gap / duplicate / missing 진단
+    # -----------------------------------------------------
+    duplicate_mask = dt_sec == 0
     non_increasing_mask = dt_sec <= 0
     gap_mask = dt_sec > expected_dt * 1.5
-    large_deviation_mask = (dt_sec - expected_dt).abs() > expected_dt * 0.5
+    large_deviation_mask = abs_diff > expected_dt * 0.5
 
-    qa_meta["n_duplicate_or_non_increasing"] = int(non_increasing_mask.sum())
+    qa_meta["n_duplicate_intervals"] = int(duplicate_mask.sum())
+    qa_meta["n_non_increasing_intervals"] = int(non_increasing_mask.sum())
     qa_meta["n_gap_intervals"] = int(gap_mask.sum())
     qa_meta["n_large_dt_deviation"] = int(large_deviation_mask.sum())
+
+    gap_rows = dt_sec[gap_mask]
+    gap_records = []
+    for curr_idx, curr_dt in gap_rows.items():
+        gap_records.append(
+            {
+                "index": int(curr_idx),
+                "time": str(work.loc[curr_idx, "analysis_time"]),
+                "dt_sec": float(curr_dt),
+            }
+        )
+    qa_meta["gap_intervals"] = gap_records
 
     if expected_dt > 0:
         estimated_missing = ((dt_sec[gap_mask] / expected_dt).round() - 1).clip(lower=0).sum()
@@ -816,6 +842,16 @@ def main():
         excluded_txt = load_meta.get("excluded_raw_txt")
         if excluded_txt:
             print(f"- 처리 제외 raw 행 파일(.txt): {excluded_txt}")
+
+        qa_meta = results.meta.get("timebase_qa", {})
+        if qa_meta:
+            print("- 시간축 QA 요약:")
+            print(f"  · expected dt (sec): {qa_meta.get('expected_dt_sec')}")
+            print(f"  · dt mean/median (sec): {qa_meta.get('dt_mean_sec')} / {qa_meta.get('dt_median_sec')}")
+            print(f"  · dt min/max (sec): {qa_meta.get('dt_min_sec')} / {qa_meta.get('dt_max_sec')}")
+            print(f"  · |dt-expected| mean/max (sec): {qa_meta.get('dt_abs_diff_mean_sec')} / {qa_meta.get('dt_abs_diff_max_sec')}")
+            print(f"  · gap intervals: {qa_meta.get('n_gap_intervals')}")
+            print(f"  · duplicate intervals(dt=0): {qa_meta.get('n_duplicate_intervals')}")
 
         print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa까지 수행했습니다.")
         print("- 다음 단계에서는 run_depth_qc()를 구현하는 것이 가장 적절합니다.")
