@@ -464,6 +464,7 @@ def run_timebase_qa(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
         "post_clean_n_non_increasing_intervals": 0,
         "post_clean_n_gap_intervals": 0,
         "post_clean_gap_intervals": [],
+        "gap_rows": [],
         "post_clean_estimated_missing_samples": 0,
         "post_clean_n_large_dt_deviation": 0,
     }
@@ -523,12 +524,48 @@ def run_timebase_qa(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
             }
         )
     qa_meta["post_clean_gap_intervals"] = gap_records
+    qa_meta["gap_rows"] = gap_records
 
     if expected_dt > 0:
         estimated_missing = ((dt_sec[gap_mask] / expected_dt).round() - 1).clip(lower=0).sum()
         qa_meta["post_clean_estimated_missing_samples"] = int(estimated_missing)
 
     return df, qa_meta
+
+
+def run_gap_handling(df: pd.DataFrame, cfg: Config, qa_meta: Dict) -> Tuple[pd.DataFrame, Dict]:
+    """
+    gap 구간 분류 모듈
+
+    현재 구현
+    - run_timebase_qa()의 gap_rows를 입력으로 받음
+    - short gap / long gap 분류
+    - 실제 보간/수정 없이 목록화만 수행
+    """
+    gap_rows = qa_meta.get("gap_rows", [])
+
+    short_gap_rows = []
+    long_gap_rows = []
+
+    for row in gap_rows:
+        dt_sec = row.get("dt_sec")
+
+        if dt_sec is None:
+            continue
+
+        if dt_sec <= 0.3:
+            short_gap_rows.append(row)
+        else:
+            long_gap_rows.append(row)
+
+    gap_meta = {
+        "short_gap_count": int(len(short_gap_rows)),
+        "long_gap_count": int(len(long_gap_rows)),
+        "short_gap_rows": short_gap_rows,
+        "long_gap_rows": long_gap_rows,
+    }
+
+    return df, gap_meta
 
 
 def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
@@ -759,6 +796,9 @@ def run_pipeline(file_path: Path, cfg: Config, out_dir: Path) -> AnalysisResults
         results.qa = meta
         log_meta(results, "timebase_qa", meta)
 
+        df, gap_meta = run_gap_handling(df, cfg, meta)
+        log_meta(results, "gap_handling", gap_meta)
+
     # if cfg.run_depth_qc:
     #     df, meta = run_depth_qc(df, cfg)
     #     results.qc = meta
@@ -854,7 +894,13 @@ def main():
             print(f"  · gap intervals: {qa_meta.get('post_clean_n_gap_intervals')}")
             print(f"  · duplicate intervals(dt=0): {qa_meta.get('post_clean_n_duplicate_intervals')}")
 
-        print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa까지 수행했습니다.")
+        gap_meta = results.meta.get("gap_handling", {})
+        if gap_meta:
+            print("- Gap Handling 요약:")
+            print(f"  · short gap count (dt<=0.3s): {gap_meta.get('short_gap_count')}")
+            print(f"  · long gap count  (dt>0.3s): {gap_meta.get('long_gap_count')}")
+
+        print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling까지 수행했습니다.")
         print("- 다음 단계에서는 run_depth_qc()를 구현하는 것이 가장 적절합니다.")
 
     except Exception as e:
