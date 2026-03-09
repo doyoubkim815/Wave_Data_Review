@@ -395,11 +395,11 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict,
         "time_axis_source": "time_local",
         "analysis_time_start": str(df["analysis_time"].min()),
         "analysis_time_end": str(df["analysis_time"].max()),
-        "rows_dropped_due_to_invalid_time": int(invalid_time_mask.sum()),
-        "rows_dropped_due_to_duplicate_time": int(duplicate_time_mask.sum()),
-        "rows_dropped_due_to_invalid_depth": int(invalid_depth_mask.sum()),
-        "rows_excluded_total_unique": int(excluded_mask.sum()),
-        "rows_excluded_with_multiple_reasons": multi_reason_rows,
+        "pre_clean_rows_dropped_due_to_invalid_time": int(invalid_time_mask.sum()),
+        "pre_clean_rows_dropped_due_to_duplicate_time": int(duplicate_time_mask.sum()),
+        "pre_clean_rows_dropped_due_to_invalid_depth": int(invalid_depth_mask.sum()),
+        "pre_clean_rows_excluded_total_unique": int(excluded_mask.sum()),
+        "pre_clean_rows_excluded_with_multiple_reasons": multi_reason_rows,
     }
 
     return df.drop(columns=["raw_row_index"]), time_meta, excluded_rows_df.reset_index(drop=True)
@@ -448,24 +448,24 @@ def run_timebase_qa(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
         raise KeyError("run_timebase_qa() 실행을 위해 'analysis_time' 컬럼이 필요합니다.")
 
     qa_meta = {
-        "expected_dt_sec": float(cfg.expected_dt_sec),
-        "n_rows": int(len(df)),
-        "n_intervals": 0,
-        "dt_mean_sec": None,
-        "dt_std_sec": None,
-        "dt_min_sec": None,
-        "dt_q05_sec": None,
-        "dt_median_sec": None,
-        "dt_q95_sec": None,
-        "dt_max_sec": None,
-        "dt_abs_diff_mean_sec": None,
-        "dt_abs_diff_max_sec": None,
-        "n_duplicate_intervals": 0,
-        "n_non_increasing_intervals": 0,
-        "n_gap_intervals": 0,
-        "gap_intervals": [],
-        "estimated_missing_samples": 0,
-        "n_large_dt_deviation": 0,
+        "post_clean_expected_dt_sec": float(cfg.expected_dt_sec),
+        "post_clean_n_rows": int(len(df)),
+        "post_clean_n_intervals": 0,
+        "post_clean_dt_mean_sec": None,
+        "post_clean_dt_std_sec": None,
+        "post_clean_dt_min_sec": None,
+        "post_clean_dt_q05_sec": None,
+        "post_clean_dt_median_sec": None,
+        "post_clean_dt_q95_sec": None,
+        "post_clean_dt_max_sec": None,
+        "post_clean_dt_abs_diff_mean_sec": None,
+        "post_clean_dt_abs_diff_max_sec": None,
+        "post_clean_n_duplicate_intervals": 0,
+        "post_clean_n_non_increasing_intervals": 0,
+        "post_clean_n_gap_intervals": 0,
+        "post_clean_gap_intervals": [],
+        "post_clean_estimated_missing_samples": 0,
+        "post_clean_n_large_dt_deviation": 0,
     }
 
     if len(df) < 2:
@@ -478,26 +478,26 @@ def run_timebase_qa(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     dt_series = work["analysis_time"].diff().dt.total_seconds()
     dt_sec = dt_series.dropna()
 
-    qa_meta["n_intervals"] = int(len(dt_sec))
+    qa_meta["post_clean_n_intervals"] = int(len(dt_sec))
 
     # -----------------------------------------------------
     # 2) dt 분포 요약 통계
     # -----------------------------------------------------
-    qa_meta["dt_mean_sec"] = float(dt_sec.mean())
-    qa_meta["dt_std_sec"] = float(dt_sec.std(ddof=0))
-    qa_meta["dt_min_sec"] = float(dt_sec.min())
-    qa_meta["dt_q05_sec"] = float(dt_sec.quantile(0.05))
-    qa_meta["dt_median_sec"] = float(dt_sec.median())
-    qa_meta["dt_q95_sec"] = float(dt_sec.quantile(0.95))
-    qa_meta["dt_max_sec"] = float(dt_sec.max())
+    qa_meta["post_clean_dt_mean_sec"] = float(dt_sec.mean())
+    qa_meta["post_clean_dt_std_sec"] = float(dt_sec.std(ddof=0))
+    qa_meta["post_clean_dt_min_sec"] = float(dt_sec.min())
+    qa_meta["post_clean_dt_q05_sec"] = float(dt_sec.quantile(0.05))
+    qa_meta["post_clean_dt_median_sec"] = float(dt_sec.median())
+    qa_meta["post_clean_dt_q95_sec"] = float(dt_sec.quantile(0.95))
+    qa_meta["post_clean_dt_max_sec"] = float(dt_sec.max())
 
     # -----------------------------------------------------
     # 3) expected_dt 대비 편차 통계
     # -----------------------------------------------------
     expected_dt = float(cfg.expected_dt_sec)
     abs_diff = (dt_sec - expected_dt).abs()
-    qa_meta["dt_abs_diff_mean_sec"] = float(abs_diff.mean())
-    qa_meta["dt_abs_diff_max_sec"] = float(abs_diff.max())
+    qa_meta["post_clean_dt_abs_diff_mean_sec"] = float(abs_diff.mean())
+    qa_meta["post_clean_dt_abs_diff_max_sec"] = float(abs_diff.max())
 
     # -----------------------------------------------------
     # 4) gap / duplicate / missing 진단
@@ -507,10 +507,10 @@ def run_timebase_qa(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     gap_mask = dt_sec > expected_dt * 1.5
     large_deviation_mask = abs_diff > expected_dt * 0.5
 
-    qa_meta["n_duplicate_intervals"] = int(duplicate_mask.sum())
-    qa_meta["n_non_increasing_intervals"] = int(non_increasing_mask.sum())
-    qa_meta["n_gap_intervals"] = int(gap_mask.sum())
-    qa_meta["n_large_dt_deviation"] = int(large_deviation_mask.sum())
+    qa_meta["post_clean_n_duplicate_intervals"] = int(duplicate_mask.sum())
+    qa_meta["post_clean_n_non_increasing_intervals"] = int(non_increasing_mask.sum())
+    qa_meta["post_clean_n_gap_intervals"] = int(gap_mask.sum())
+    qa_meta["post_clean_n_large_dt_deviation"] = int(large_deviation_mask.sum())
 
     gap_rows = dt_sec[gap_mask]
     gap_records = []
@@ -522,11 +522,11 @@ def run_timebase_qa(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
                 "dt_sec": float(curr_dt),
             }
         )
-    qa_meta["gap_intervals"] = gap_records
+    qa_meta["post_clean_gap_intervals"] = gap_records
 
     if expected_dt > 0:
         estimated_missing = ((dt_sec[gap_mask] / expected_dt).round() - 1).clip(lower=0).sum()
-        qa_meta["estimated_missing_samples"] = int(estimated_missing)
+        qa_meta["post_clean_estimated_missing_samples"] = int(estimated_missing)
 
     return df, qa_meta
 
@@ -823,16 +823,16 @@ def main():
 
         raw_n_rows = load_meta.get("raw_n_rows")
         processed_n_rows = load_meta.get("processed_n_rows")
-        dropped_invalid_time = load_meta.get("rows_dropped_due_to_invalid_time", 0)
-        dropped_duplicate_time = load_meta.get("rows_dropped_due_to_duplicate_time", 0)
-        dropped_invalid_depth = load_meta.get("rows_dropped_due_to_invalid_depth", 0)
-        excluded_unique = load_meta.get("rows_excluded_total_unique", 0)
-        excluded_multi_reason = load_meta.get("rows_excluded_with_multiple_reasons", 0)
+        dropped_invalid_time = load_meta.get("pre_clean_rows_dropped_due_to_invalid_time", 0)
+        dropped_duplicate_time = load_meta.get("pre_clean_rows_dropped_due_to_duplicate_time", 0)
+        dropped_invalid_depth = load_meta.get("pre_clean_rows_dropped_due_to_invalid_depth", 0)
+        excluded_unique = load_meta.get("pre_clean_rows_excluded_total_unique", 0)
+        excluded_multi_reason = load_meta.get("pre_clean_rows_excluded_with_multiple_reasons", 0)
 
         if isinstance(raw_n_rows, int) and isinstance(processed_n_rows, int):
             excluded_n_rows = raw_n_rows - processed_n_rows
-            print(f"- 처리 제외 행 수(총): {excluded_n_rows}")
-            print(f"- 처리 제외 행 수(고유): {excluded_unique}")
+            print(f"- 입력 정리(pre-clean) 제외 행 수(총): {excluded_n_rows}")
+            print(f"- 입력 정리(pre-clean) 제외 행 수(고유): {excluded_unique}")
             print("  · 제외 근거(대략):")
             print(f"    - time_local 파싱 실패/결측으로 제외: {dropped_invalid_time}")
             print(f"    - analysis_time 중복으로 제외: {dropped_duplicate_time}")
@@ -845,13 +845,14 @@ def main():
 
         qa_meta = results.meta.get("timebase_qa", {})
         if qa_meta:
-            print("- 시간축 QA 요약:")
-            print(f"  · expected dt (sec): {qa_meta.get('expected_dt_sec')}")
-            print(f"  · dt mean/median (sec): {qa_meta.get('dt_mean_sec')} / {qa_meta.get('dt_median_sec')}")
-            print(f"  · dt min/max (sec): {qa_meta.get('dt_min_sec')} / {qa_meta.get('dt_max_sec')}")
-            print(f"  · |dt-expected| mean/max (sec): {qa_meta.get('dt_abs_diff_mean_sec')} / {qa_meta.get('dt_abs_diff_max_sec')}")
-            print(f"  · gap intervals: {qa_meta.get('n_gap_intervals')}")
-            print(f"  · duplicate intervals(dt=0): {qa_meta.get('n_duplicate_intervals')}")
+            print("- 시간축 QA 요약(post-clean):")
+            print(f"  · expected dt (sec): {qa_meta.get('post_clean_expected_dt_sec')}")
+            print(f"  · n_rows / n_intervals: {qa_meta.get('post_clean_n_rows')} / {qa_meta.get('post_clean_n_intervals')}")
+            print(f"  · dt mean/median (sec): {qa_meta.get('post_clean_dt_mean_sec')} / {qa_meta.get('post_clean_dt_median_sec')}")
+            print(f"  · dt min/max (sec): {qa_meta.get('post_clean_dt_min_sec')} / {qa_meta.get('post_clean_dt_max_sec')}")
+            print(f"  · |dt-expected| mean/max (sec): {qa_meta.get('post_clean_dt_abs_diff_mean_sec')} / {qa_meta.get('post_clean_dt_abs_diff_max_sec')}")
+            print(f"  · gap intervals: {qa_meta.get('post_clean_n_gap_intervals')}")
+            print(f"  · duplicate intervals(dt=0): {qa_meta.get('post_clean_n_duplicate_intervals')}")
 
         print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa까지 수행했습니다.")
         print("- 다음 단계에서는 run_depth_qc()를 구현하는 것이 가장 적절합니다.")
