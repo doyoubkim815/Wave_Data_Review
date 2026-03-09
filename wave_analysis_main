@@ -681,8 +681,13 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
                 "n_rows": int(len(g)),
             }
             if "analysis_time" in df.columns:
-                rec["start_time"] = str(df.loc[start_idx, "analysis_time"])
-                rec["end_time"] = str(df.loc[end_idx, "analysis_time"])
+                start_time = df.loc[start_idx, "analysis_time"]
+                end_time = df.loc[end_idx, "analysis_time"]
+                rec["start_time"] = str(start_time)
+                rec["end_time"] = str(end_time)
+                rec["duration_sec"] = float((end_time - start_time).total_seconds())
+            else:
+                rec["duration_sec"] = float(max(0.0, (len(g) - 1) * dt))
             bad_segment_rows.append(rec)
 
     # time-domain 분석 제외 후보: bad segment는 False
@@ -698,13 +703,28 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     slope_all = depth.diff().abs() / dt
     max_abs_slope = float(slope_all.max()) if slope_all.notna().any() else 0.0
 
-    n_flagged = int(anomaly_mask.sum())
-    spike_rate = float(n_flagged / len(df)) if len(df) > 0 else 0.0
+    n_flagged_hampel = int(spike_mask_hampel.sum())
+    n_flagged_slope = int(spike_mask_slope.sum())
+    n_flagged_union = int(anomaly_mask.sum())
+    spike_rate = float(n_flagged_union / len(df)) if len(df) > 0 else 0.0
+
+    n_analysis_mask_false = int((~analysis_mask_time_domain).sum())
+    analysis_mask_false_rate = float(n_analysis_mask_false / len(df)) if len(df) > 0 else 0.0
+
+    n_bad_segments_short = int(sum(1 for r in bad_segment_rows if r.get("duration_sec", 0.0) <= 0.3))
+    n_bad_segments_long = int(sum(1 for r in bad_segment_rows if r.get("duration_sec", 0.0) > 0.3))
 
     qc_meta = {
-        "n_flagged_spikes": n_flagged,
+        "n_flagged_spikes": n_flagged_union,
+        "n_flagged_spikes_hampel": n_flagged_hampel,
+        "n_flagged_spikes_slope": n_flagged_slope,
+        "n_flagged_spikes_union": n_flagged_union,
         "spike_rate": spike_rate,
+        "n_analysis_mask_time_domain_false": n_analysis_mask_false,
+        "analysis_mask_time_domain_false_rate": analysis_mask_false_rate,
         "n_bad_segments": int(len(bad_segment_rows)),
+        "n_bad_segments_short": n_bad_segments_short,
+        "n_bad_segments_long": n_bad_segments_long,
         "bad_segment_rows": bad_segment_rows,
         "method": cfg.depth_qc_method,
         "window_sec": float(cfg.depth_qc_window_sec),
@@ -1040,8 +1060,10 @@ def main():
         if depth_qc_meta:
             print("- Depth QC 요약:")
             print(f"  · method: {depth_qc_meta.get('method')}")
-            print(f"  · n_flagged_spikes / spike_rate: {depth_qc_meta.get('n_flagged_spikes')} / {depth_qc_meta.get('spike_rate')}")
-            print(f"  · n_bad_segments: {depth_qc_meta.get('n_bad_segments')}")
+            print(f"  · n_flagged_spikes(hampel/slope/union): {depth_qc_meta.get('n_flagged_spikes_hampel')} / {depth_qc_meta.get('n_flagged_spikes_slope')} / {depth_qc_meta.get('n_flagged_spikes_union')}")
+            print(f"  · spike_rate: {depth_qc_meta.get('spike_rate')}")
+            print(f"  · analysis_mask_time_domain=False 개수/비율: {depth_qc_meta.get('n_analysis_mask_time_domain_false')} / {depth_qc_meta.get('analysis_mask_time_domain_false_rate')}")
+            print(f"  · n_bad_segments(short/long): {depth_qc_meta.get('n_bad_segments_short')} / {depth_qc_meta.get('n_bad_segments_long')}")
             print(f"  · max_abs_slope (m/s): {depth_qc_meta.get('max_abs_slope')}")
 
         print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling, depth_qc까지 수행했습니다.")
