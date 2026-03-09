@@ -38,6 +38,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import pandas as pd
 
 
@@ -714,6 +715,23 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     n_bad_segments_short = int(sum(1 for r in bad_segment_rows if r.get("duration_sec", 0.0) <= 0.3))
     n_bad_segments_long = int(sum(1 for r in bad_segment_rows if r.get("duration_sec", 0.0) > 0.3))
 
+    depth_std_before = float(depth.std(skipna=True)) if depth.notna().any() else None
+    kept_depth = depth[analysis_mask_time_domain]
+    depth_std_after = float(kept_depth.std(skipna=True)) if kept_depth.notna().any() else None
+    if depth_std_before is None or depth_std_before == 0 or depth_std_after is None:
+        depth_std_ratio = None
+    else:
+        depth_std_ratio = float(depth_std_after / depth_std_before)
+
+    prev_depth = depth.shift(1)
+    next_depth = depth.shift(-1)
+    local_extrema_mask = ((depth > prev_depth) & (depth > next_depth)) | ((depth < prev_depth) & (depth < next_depth))
+    local_extrema_near_mask = local_extrema_mask | local_extrema_mask.shift(1, fill_value=False) | local_extrema_mask.shift(-1, fill_value=False)
+    if n_flagged_union > 0:
+        extrema_flag_ratio = float((anomaly_mask & local_extrema_near_mask).sum() / n_flagged_union)
+    else:
+        extrema_flag_ratio = None
+
     qc_meta = {
         "n_flagged_spikes": n_flagged_union,
         "n_flagged_spikes_hampel": n_flagged_hampel,
@@ -726,6 +744,10 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
         "n_bad_segments_short": n_bad_segments_short,
         "n_bad_segments_long": n_bad_segments_long,
         "bad_segment_rows": bad_segment_rows,
+        "depth_std_before": depth_std_before,
+        "depth_std_after": depth_std_after,
+        "depth_std_ratio": depth_std_ratio,
+        "extrema_flag_ratio": extrema_flag_ratio,
         "method": cfg.depth_qc_method,
         "window_sec": float(cfg.depth_qc_window_sec),
         "n_sigma": float(cfg.depth_qc_n_sigma),
@@ -880,6 +902,136 @@ def save_excluded_rows_txt(excluded_df: pd.DataFrame, out_dir: Path, filename: s
     return output_path
 
 
+def plot_depth_qc_review(df: pd.DataFrame, out_dir: Path, cfg: Config, qc_meta: Dict) -> Dict:
+    """
+    Depth QC 검증용 시각화/진단 모듈
+
+    현재 구현
+    - 자동 구간 선택: longest bad segments 상위 3개 + flagged 밀집 구간 2개
+    - raw depth_m, flagged points, analysis_mask_time_domain=False 구간 표시
+    """
+    review_meta = {
+        "selected_segments": [],
+        "saved_plots": [],
+        "extrema_flag_ratio": qc_meta.get("extrema_flag_ratio"),
+    }
+
+    if not cfg.save_plot:
+        return review_meta
+
+    if cfg.depth_col not in df.columns:
+        return review_meta
+
+    flagged_mask = (df.get("depth_flag_spike", False) | df.get("depth_flag_bad_segment", False)).astype(bool)
+    bad_mask = (~df.get("analysis_mask_time_domain", True)).astype(bool)
+
+    selected = []
+
+    # -----------------------------------------------------
+    # 1) longest bad segments 상위 3개
+    # -----------------------------------------------------
+    bad_segments = sorted(qc_meta.get("bad_segment_rows", []), key=lambda x: x.get("duration_sec", 0.0), reverse=True)
+    for seg in bad_segments[:3]:
+        selected.append({
+            "start_index": int(seg.get("start_index", 0)),
+            "end_index": int(seg.get("end_index", 0)),
+            "label": "longest_bad_segment",
+        })
+
+    # -----------------------------------------------------
+    # 2) flagged point 밀집 구간 2개
+    # -----------------------------------------------------
+    dt = float(cfg.expected_dt_sec)
+    if "analysis_time" in df.columns and len(df) >= 2:
+        dt_series = df["analysis_time"].sort_values().diff().dt.total_seconds().dropna()
+        dt_series = dt_series[dt_series > 0]
+        if not dt_series.empty:
+            dt = float(dt_series.median())
+
+    window_n = max(5, int(round(10.0 / dt)))
+    density = flagged_mask.astype(int).rolling(window=window_n, center=True, min_periods=1).sum()
+    top_centers = density.sort_values(ascending=False).index.tolist()
+
+    used_centers = []
+    for c in top_centers:
+        if len(used_centers) >= 2:
+            break
+        if any(abs(int(c) - uc) < window_n for uc in used_centers):
+            continue
+        used_centers.append(int(c))
+
+    for c in used_centers:
+        start_idx = max(0, c - window_n // 2)
+        end_idx = min(len(df) - 1, c + window_n // 2)
+        selected.append({
+            "start_index": int(start_idx),
+            "end_index": int(end_idx),
+            "label": "flag_density_window",
+        })
+
+    # 중복 구간 제거
+    uniq = []
+    seen = set()
+    for seg in selected:
+        key = (seg["start_index"], seg["end_index"], seg["label"])
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(seg)
+
+    review_meta["selected_segments"] = uniq
+
+    # -----------------------------------------------------
+    # 3) 구간별 그래프 저장
+    # -----------------------------------------------------
+    for i, seg in enumerate(uniq, start=1):
+        s_idx = seg["start_index"]
+        e_idx = seg["end_index"]
+        part = df.iloc[s_idx:e_idx + 1].copy()
+
+        if part.empty:
+            continue
+
+        x = part["analysis_time"] if "analysis_time" in part.columns else part.index
+        y = pd.to_numeric(part[cfg.depth_col], errors="coerce")
+
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.plot(x, y, color="black", linewidth=1.0, label="raw depth_m")
+
+        part_flagged = part[flagged_mask.iloc[s_idx:e_idx + 1].values]
+        if not part_flagged.empty:
+            xf = part_flagged["analysis_time"] if "analysis_time" in part_flagged.columns else part_flagged.index
+            yf = pd.to_numeric(part_flagged[cfg.depth_col], errors="coerce")
+            ax.scatter(xf, yf, color="red", s=20, label="flagged points", zorder=5)
+
+        local_bad = bad_mask.iloc[s_idx:e_idx + 1].reset_index(drop=True)
+        if local_bad.any():
+            rid = (local_bad != local_bad.shift(1, fill_value=False)).cumsum()
+            for _, grp in local_bad[local_bad].groupby(rid[local_bad]):
+                gs = grp.index.min()
+                ge = grp.index.max()
+                x0 = x.iloc[gs]
+                x1 = x.iloc[ge]
+                ax.axvspan(x0, x1, color="orange", alpha=0.25, label="analysis_mask_time_domain=False")
+
+        ax.set_title(f"Depth QC Review #{i} ({seg['label']})")
+        ax.set_xlabel("time")
+        ax.set_ylabel("depth_m")
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys(), loc="best")
+        ax.grid(alpha=0.3)
+
+        output_path = out_dir / f"depth_qc_review_{i:02d}.png"
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150)
+        plt.close(fig)
+
+        review_meta["saved_plots"].append(str(output_path))
+
+    return review_meta
+
+
 def plot_time_domain_stats(td_stats_df: pd.DataFrame, out_dir: Path, cfg: Config):
     """
     시간영역 통계 그래프 저장 모듈
@@ -959,6 +1111,9 @@ def run_pipeline(file_path: Path, cfg: Config, out_dir: Path) -> AnalysisResults
         df, meta = run_depth_qc(df, cfg)
         results.qc = meta
         log_meta(results, "depth_qc", meta)
+
+        review_meta = plot_depth_qc_review(df, out_dir, cfg, meta)
+        log_meta(results, "depth_qc_review", review_meta)
 
     # if cfg.run_detrend:
     #     df, meta = run_detrend(df, cfg)
@@ -1064,7 +1219,15 @@ def main():
             print(f"  · spike_rate: {depth_qc_meta.get('spike_rate')}")
             print(f"  · analysis_mask_time_domain=False 개수/비율: {depth_qc_meta.get('n_analysis_mask_time_domain_false')} / {depth_qc_meta.get('analysis_mask_time_domain_false_rate')}")
             print(f"  · n_bad_segments(short/long): {depth_qc_meta.get('n_bad_segments_short')} / {depth_qc_meta.get('n_bad_segments_long')}")
+            print(f"  · std ratio (after/before): {depth_qc_meta.get('depth_std_ratio')}")
+            print(f"  · extrema_flag_ratio: {depth_qc_meta.get('extrema_flag_ratio')}")
             print(f"  · max_abs_slope (m/s): {depth_qc_meta.get('max_abs_slope')}")
+
+        depth_qc_review_meta = results.meta.get("depth_qc_review", {})
+        if depth_qc_review_meta:
+            print("- Depth QC Review 요약:")
+            print(f"  · selected segments: {len(depth_qc_review_meta.get('selected_segments', []))}")
+            print(f"  · saved plots: {len(depth_qc_review_meta.get('saved_plots', []))}")
 
         print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling, depth_qc까지 수행했습니다.")
         print("- 다음 단계에서는 run_detrend()를 구현하는 것이 가장 적절합니다.")
