@@ -38,6 +38,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 
@@ -66,6 +67,13 @@ class Config:
     # 1-2. 샘플링 관련
     # -----------------------------------------------------
     expected_dt_sec: float = 0.1          # 기대 샘플링 간격(초)
+
+    # depth QC 파라미터
+    depth_qc_method: str = "hampel"
+    depth_qc_window_sec: float = 3.0
+    depth_qc_n_sigma: float = 6.0
+    depth_qc_max_slope_mps: float = 2.0
+    depth_qc_replace_mode: str = "interp"   # "median" | "interp" | "nan"
 
     # -----------------------------------------------------
     # 1-3. 분석 기능 ON / OFF
@@ -572,12 +580,133 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     """
     depth_m 이상치 제거 모듈
 
-    향후 구현 예정
-    - Hampel filter
-    - rolling MAD 기반 스파이크 제거
-    - 제거 개수 / 비율 기록
+    현재 구현
+    - Hampel(rolling median + MAD) 기반 스파이크 후보 플래그
+    - |d(depth)/dt| 물리 룰 기반 스파이크 후보 플래그
+    - replace_mode에 따른 depth_m_qc 생성
     """
-    raise NotImplementedError("run_depth_qc()는 다음 단계에서 구현 예정입니다.")
+    if cfg.depth_col not in df.columns:
+        raise KeyError(f"run_depth_qc() 실행을 위해 '{cfg.depth_col}' 컬럼이 필요합니다.")
+
+    def qc_despike_depth(
+        depth: pd.Series,
+        dt: float,
+        method: str = "hampel",
+        window_sec: float = 3.0,
+        n_sigma: float = 6.0,
+        max_slope_mps: float = 2.0,
+    ) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        """
+        depth 시계열의 스파이크 후보를 탐지한다.
+
+        반환
+        - spike_mask_hampel
+        - spike_mask_slope
+        - rolling_median
+        """
+        if method != "hampel":
+            raise ValueError("현재 depth QC는 method='hampel'만 지원합니다.")
+
+        # -------------------------------------------------
+        # 1) Hampel 파라미터 계산
+        # -------------------------------------------------
+        if dt <= 0:
+            raise ValueError("dt는 0보다 커야 합니다.")
+
+        window_n = max(3, int(round(window_sec / dt)))
+        if window_n % 2 == 0:
+            window_n += 1
+
+        # -------------------------------------------------
+        # 2) rolling median + MAD 기반 플래그
+        # -------------------------------------------------
+        rolling_median = depth.rolling(window=window_n, center=True, min_periods=1).median()
+        abs_dev = (depth - rolling_median).abs()
+        rolling_mad = abs_dev.rolling(window=window_n, center=True, min_periods=1).median()
+
+        # Hampel 임계값: 1.4826 * MAD * n_sigma
+        hampel_threshold = 1.4826 * rolling_mad * n_sigma
+        spike_mask_hampel = abs_dev > hampel_threshold
+
+        # -------------------------------------------------
+        # 3) 물리 룰 기반 slope 플래그
+        # -------------------------------------------------
+        slope = depth.diff().abs() / dt
+        spike_mask_slope = slope > max_slope_mps
+
+        # diff로 생성된 첫 행 slope NaN은 False 처리
+        spike_mask_slope = spike_mask_slope.fillna(False)
+        spike_mask_hampel = spike_mask_hampel.fillna(False)
+
+        return spike_mask_hampel, spike_mask_slope, rolling_median
+
+    df = df.copy()
+    depth = pd.to_numeric(df[cfg.depth_col], errors="coerce")
+
+    # -----------------------------------------------------
+    # 1) dt 추정 (analysis_time 기반)
+    # -----------------------------------------------------
+    dt = float(cfg.expected_dt_sec)
+    if "analysis_time" in df.columns and len(df) >= 2:
+        dt_series = df["analysis_time"].sort_values().diff().dt.total_seconds().dropna()
+        dt_series = dt_series[dt_series > 0]
+        if not dt_series.empty:
+            dt = float(dt_series.median())
+
+    # -----------------------------------------------------
+    # 2) 스파이크 플래그 계산
+    # -----------------------------------------------------
+    spike_mask_hampel, spike_mask_slope, rolling_median = qc_despike_depth(
+        depth=depth,
+        dt=dt,
+        method=cfg.depth_qc_method,
+        window_sec=cfg.depth_qc_window_sec,
+        n_sigma=cfg.depth_qc_n_sigma,
+        max_slope_mps=cfg.depth_qc_max_slope_mps,
+    )
+
+    spike_mask = spike_mask_hampel | spike_mask_slope
+
+    # -----------------------------------------------------
+    # 3) replace_mode에 따른 depth_m_qc 생성
+    # -----------------------------------------------------
+    replace_mode = cfg.depth_qc_replace_mode.lower()
+    if replace_mode not in ["median", "interp", "nan"]:
+        raise ValueError("depth_qc_replace_mode는 'median', 'interp', 'nan' 중 하나여야 합니다.")
+
+    depth_qc = depth.copy()
+
+    if replace_mode == "median":
+        depth_qc.loc[spike_mask] = rolling_median.loc[spike_mask]
+    elif replace_mode == "interp":
+        depth_qc.loc[spike_mask] = np.nan
+        depth_qc = depth_qc.interpolate(method="linear", limit_direction="both")
+    else:
+        depth_qc.loc[spike_mask] = np.nan
+
+    df["depth_m_qc"] = depth_qc
+
+    # -----------------------------------------------------
+    # 4) 메타정보 정리
+    # -----------------------------------------------------
+    slope_all = depth.diff().abs() / dt
+    max_abs_slope = float(slope_all.max()) if slope_all.notna().any() else 0.0
+
+    n_spikes = int(spike_mask.sum())
+    spike_rate = float(n_spikes / len(df)) if len(df) > 0 else 0.0
+
+    qc_meta = {
+        "n_spikes": n_spikes,
+        "spike_rate": spike_rate,
+        "max_abs_slope": max_abs_slope,
+        "method": cfg.depth_qc_method,
+        "window_sec": float(cfg.depth_qc_window_sec),
+        "n_sigma": float(cfg.depth_qc_n_sigma),
+        "max_slope_mps": float(cfg.depth_qc_max_slope_mps),
+        "replace_mode": replace_mode,
+    }
+
+    return df, qc_meta
 
 
 def run_detrend(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
@@ -799,11 +928,11 @@ def run_pipeline(file_path: Path, cfg: Config, out_dir: Path) -> AnalysisResults
         df, gap_meta = run_gap_handling(df, cfg, meta)
         log_meta(results, "gap_handling", gap_meta)
 
-    # if cfg.run_depth_qc:
-    #     df, meta = run_depth_qc(df, cfg)
-    #     results.qc = meta
-    #     log_meta(results, "depth_qc", meta)
-    #
+    if cfg.run_depth_qc:
+        df, meta = run_depth_qc(df, cfg)
+        results.qc = meta
+        log_meta(results, "depth_qc", meta)
+
     # if cfg.run_detrend:
     #     df, meta = run_detrend(df, cfg)
     #     log_meta(results, "detrend", meta)
@@ -900,8 +1029,15 @@ def main():
             print(f"  · short gap count (dt<=0.3s): {gap_meta.get('short_gap_count')}")
             print(f"  · long gap count  (dt>0.3s): {gap_meta.get('long_gap_count')}")
 
-        print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling까지 수행했습니다.")
-        print("- 다음 단계에서는 run_depth_qc()를 구현하는 것이 가장 적절합니다.")
+        depth_qc_meta = results.meta.get("depth_qc", {})
+        if depth_qc_meta:
+            print("- Depth QC 요약:")
+            print(f"  · method / replace_mode: {depth_qc_meta.get('method')} / {depth_qc_meta.get('replace_mode')}")
+            print(f"  · n_spikes / spike_rate: {depth_qc_meta.get('n_spikes')} / {depth_qc_meta.get('spike_rate')}")
+            print(f"  · max_abs_slope (m/s): {depth_qc_meta.get('max_abs_slope')}")
+
+        print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling, depth_qc까지 수행했습니다.")
+        print("- 다음 단계에서는 run_detrend()를 구현하는 것이 가장 적절합니다.")
 
     except Exception as e:
         print("\n[오류 발생]")
