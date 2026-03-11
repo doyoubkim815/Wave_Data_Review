@@ -1418,20 +1418,25 @@ def main():
 
         depth_qc_meta = results.meta.get("depth_qc", {})
         if depth_qc_meta:
+            def _fmt(v, nd=4):
+                if isinstance(v, (int, float)):
+                    return f"{v:.{nd}f}"
+                return v
+
             print("- Depth QC 요약:")
             print(f"  · method: {depth_qc_meta.get('method')}")
-            print(f"  · n_flagged_spikes(hampel/slope/union): {depth_qc_meta.get('n_flagged_spikes_hampel')} / {depth_qc_meta.get('n_flagged_spikes_slope')} / {depth_qc_meta.get('n_flagged_spikes_union')}")
-            print(f"  · n_hampel_only / n_slope_only / n_overlap: {depth_qc_meta.get('n_hampel_only')} / {depth_qc_meta.get('n_slope_only')} / {depth_qc_meta.get('n_overlap_hampel_slope')}")
-            print(f"  · spike_rate: {depth_qc_meta.get('spike_rate')}")
-            print(f"  · analysis_mask_time_domain=False 개수/비율: {depth_qc_meta.get('n_analysis_mask_time_domain_false')} / {depth_qc_meta.get('analysis_mask_time_domain_false_rate')}")
-            print(f"  · n_bad_segments(short/long): {depth_qc_meta.get('n_bad_segments_short')} / {depth_qc_meta.get('n_bad_segments_long')}")
-            print(f"  · bad_segment_min_duration_sec: {depth_qc_meta.get('bad_segment_min_duration_sec')}")
+            print(f"  · qc parameters (window_sec / n_sigma / max_slope_mps): {_fmt(depth_qc_meta.get('window_sec'))} sec / {_fmt(depth_qc_meta.get('n_sigma'))} / {_fmt(depth_qc_meta.get('max_slope_mps'))} m/s")
+            print(f"  · n_flagged_spikes(hampel / slope / union): {depth_qc_meta.get('n_flagged_spikes_hampel')} / {depth_qc_meta.get('n_flagged_spikes_slope')} / {depth_qc_meta.get('n_flagged_spikes_union')}")
+            print(f"  · spike_rate: {_fmt(depth_qc_meta.get('spike_rate'))}")
             print(f"  · n_isolated_spikes / n_jump_recover_spikes: {depth_qc_meta.get('n_isolated_spikes')} / {depth_qc_meta.get('n_jump_recover_spikes')}")
             print(f"  · n_plateau_candidates / n_plateau_suppressed: {depth_qc_meta.get('n_plateau_candidates')} / {depth_qc_meta.get('n_plateau_suppressed')}")
+            print(f"  · n_bad_segments(short / long): {depth_qc_meta.get('n_bad_segments_short')} / {depth_qc_meta.get('n_bad_segments_long')}")
             print(f"  · n_bad_segments_after_plateau_filter: {depth_qc_meta.get('n_bad_segments_after_plateau_filter')}")
-            print(f"  · std ratio (after/before): {depth_qc_meta.get('depth_std_ratio')}")
-            print(f"  · extrema_flag_ratio: {depth_qc_meta.get('extrema_flag_ratio')}")
-            print(f"  · max_abs_slope (m/s): {depth_qc_meta.get('max_abs_slope')}")
+            print(f"  · analysis_mask_time_domain=False 개수 / 비율: {depth_qc_meta.get('n_analysis_mask_time_domain_false')} / {_fmt(depth_qc_meta.get('analysis_mask_time_domain_false_rate'))}")
+            print(f"  · bad_segment_min_duration_sec: {_fmt(depth_qc_meta.get('bad_segment_min_duration_sec'))} sec")
+            print(f"  · max_abs_slope (m/s): {_fmt(depth_qc_meta.get('max_abs_slope'))}")
+            print(f"  · std ratio (after / before): {_fmt(depth_qc_meta.get('depth_std_ratio'))}")
+            print(f"  · extrema_flag_ratio: {_fmt(depth_qc_meta.get('extrema_flag_ratio'))}")
 
         depth_qc_review_meta = results.meta.get("depth_qc_review", {})
         if depth_qc_review_meta:
