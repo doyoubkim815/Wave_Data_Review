@@ -594,13 +594,14 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
         window_sec: float = 3.0,
         n_sigma: float = 6.0,
         max_slope_mps: float = 2.0,
-    ) -> Tuple[pd.Series, pd.Series]:
+    ) -> Tuple[pd.Series, pd.Series, pd.Series]:
         """
         depth 시계열의 이상치 후보를 탐지한다.
 
         반환
         - spike_mask_hampel
         - spike_mask_slope
+        - rolling_median
         """
         if method != "hampel":
             raise ValueError("현재 depth QC는 method='hampel'만 지원합니다.")
@@ -631,7 +632,7 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
         slope = (depth.diff().abs() / dt)
         spike_mask_slope = (slope > max_slope_mps).fillna(False)
 
-        return spike_mask_hampel, spike_mask_slope
+        return spike_mask_hampel, spike_mask_slope, rolling_median
 
     df = df.copy()
     depth = pd.to_numeric(df[cfg.depth_col], errors="coerce")
@@ -649,7 +650,7 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     # -----------------------------------------------------
     # 2) 이상치 플래그 계산
     # -----------------------------------------------------
-    spike_mask_hampel, spike_mask_slope = qc_despike_depth(
+    spike_mask_hampel, spike_mask_slope, rolling_median = qc_despike_depth(
         depth=depth,
         dt=dt,
         method=cfg.depth_qc_method,
@@ -660,8 +661,10 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     anomaly_mask = (spike_mask_hampel | spike_mask_slope)
 
     # -----------------------------------------------------
-    # 3) isolated spike vs bad segment 구분
+    # 3) isolated spike vs bad segment 구분 (과탐 완화)
     # -----------------------------------------------------
+    bad_segment_min_duration_sec = 0.5
+
     run_id = (anomaly_mask != anomaly_mask.shift(1, fill_value=False)).cumsum()
     anomaly_groups = df.loc[anomaly_mask].groupby(run_id[anomaly_mask])
 
@@ -669,27 +672,63 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     depth_flag_bad_segment = pd.Series(False, index=df.index)
     bad_segment_rows = []
 
+    n_isolated_spikes = 0
+    n_jump_recover_spikes = 0
+
+    plateau_tol = max(0.005, dt * cfg.depth_qc_max_slope_mps * 0.1)
+
     for _, g in anomaly_groups:
-        if len(g) == 1:
-            depth_flag_spike.loc[g.index] = True
+        g_idx = g.index
+        start_idx = int(g_idx.min())
+        end_idx = int(g_idx.max())
+
+        if "analysis_time" in df.columns:
+            start_time = df.loc[start_idx, "analysis_time"]
+            end_time = df.loc[end_idx, "analysis_time"]
+            duration_sec = float((end_time - start_time).total_seconds())
         else:
-            depth_flag_bad_segment.loc[g.index] = True
-            start_idx = int(g.index.min())
-            end_idx = int(g.index.max())
+            duration_sec = float(max(0.0, (len(g_idx) - 1) * dt))
+
+        seg_depth = depth.loc[g_idx]
+        seg_range = float((seg_depth.max() - seg_depth.min())) if seg_depth.notna().any() else 0.0
+        is_plateau_like = seg_range <= plateau_tol
+
+        has_slope_flag = bool(spike_mask_slope.loc[g_idx].any())
+        is_jump_recover = False
+        if len(g_idx) <= 3 and duration_sec < bad_segment_min_duration_sec and has_slope_flag:
+            if start_idx > 0 and end_idx < len(df) - 1:
+                pre_v = depth.iloc[start_idx - 1]
+                post_v = depth.iloc[end_idx + 1]
+                if pd.notna(pre_v) and pd.notna(post_v):
+                    is_jump_recover = abs(float(pre_v - post_v)) <= plateau_tol * 2
+
+        # 규칙: 충분히 길고 plateau 성격이 아닌 경우만 bad segment
+        if duration_sec >= bad_segment_min_duration_sec and not is_plateau_like:
+            depth_flag_bad_segment.loc[g_idx] = True
             rec = {
                 "start_index": start_idx,
                 "end_index": end_idx,
-                "n_rows": int(len(g)),
+                "n_rows": int(len(g_idx)),
+                "duration_sec": duration_sec,
             }
             if "analysis_time" in df.columns:
-                start_time = df.loc[start_idx, "analysis_time"]
-                end_time = df.loc[end_idx, "analysis_time"]
-                rec["start_time"] = str(start_time)
-                rec["end_time"] = str(end_time)
-                rec["duration_sec"] = float((end_time - start_time).total_seconds())
-            else:
-                rec["duration_sec"] = float(max(0.0, (len(g) - 1) * dt))
+                rec["start_time"] = str(df.loc[start_idx, "analysis_time"])
+                rec["end_time"] = str(df.loc[end_idx, "analysis_time"])
             bad_segment_rows.append(rec)
+            continue
+
+        # 그 외는 spike 후보 우선: 단일점/짧은 jump-recover 우선 처리
+        if len(g_idx) == 1:
+            depth_flag_spike.loc[g_idx] = True
+            n_isolated_spikes += 1
+        elif is_jump_recover:
+            depth_flag_spike.loc[g_idx] = True
+            n_jump_recover_spikes += int(len(g_idx))
+        else:
+            # plateau/짧은 연속구간 과탐 완화: 대표 1점만 spike로 표기
+            local_abs_dev = (depth.loc[g_idx] - rolling_median.loc[g_idx]).abs()
+            rep_idx = int(local_abs_dev.fillna(-1).idxmax())
+            depth_flag_spike.loc[rep_idx] = True
 
     # time-domain 분석 제외 후보: bad segment는 False
     analysis_mask_time_domain = (~depth_flag_bad_segment).astype(bool)
@@ -743,6 +782,9 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
         "n_bad_segments": int(len(bad_segment_rows)),
         "n_bad_segments_short": n_bad_segments_short,
         "n_bad_segments_long": n_bad_segments_long,
+        "bad_segment_min_duration_sec": bad_segment_min_duration_sec,
+        "n_isolated_spikes": int(n_isolated_spikes),
+        "n_jump_recover_spikes": int(n_jump_recover_spikes),
         "bad_segment_rows": bad_segment_rows,
         "depth_std_before": depth_std_before,
         "depth_std_after": depth_std_after,
@@ -1219,6 +1261,8 @@ def main():
             print(f"  · spike_rate: {depth_qc_meta.get('spike_rate')}")
             print(f"  · analysis_mask_time_domain=False 개수/비율: {depth_qc_meta.get('n_analysis_mask_time_domain_false')} / {depth_qc_meta.get('analysis_mask_time_domain_false_rate')}")
             print(f"  · n_bad_segments(short/long): {depth_qc_meta.get('n_bad_segments_short')} / {depth_qc_meta.get('n_bad_segments_long')}")
+            print(f"  · bad_segment_min_duration_sec: {depth_qc_meta.get('bad_segment_min_duration_sec')}")
+            print(f"  · n_isolated_spikes / n_jump_recover_spikes: {depth_qc_meta.get('n_isolated_spikes')} / {depth_qc_meta.get('n_jump_recover_spikes')}")
             print(f"  · std ratio (after/before): {depth_qc_meta.get('depth_std_ratio')}")
             print(f"  · extrema_flag_ratio: {depth_qc_meta.get('extrema_flag_ratio')}")
             print(f"  · max_abs_slope (m/s): {depth_qc_meta.get('max_abs_slope')}")
