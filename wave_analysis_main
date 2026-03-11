@@ -661,9 +661,10 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     anomaly_mask = (spike_mask_hampel | spike_mask_slope)
 
     # -----------------------------------------------------
-    # 3) isolated spike vs bad segment 구분 (과탐 완화)
+    # 3) isolated spike vs bad segment 구분 (plateau 과탐 완화)
     # -----------------------------------------------------
     bad_segment_min_duration_sec = 0.5
+    bad_segment_max_duration_sec = 0.8
 
     run_id = (anomaly_mask != anomaly_mask.shift(1, fill_value=False)).cumsum()
     anomaly_groups = df.loc[anomaly_mask].groupby(run_id[anomaly_mask])
@@ -674,8 +675,12 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
 
     n_isolated_spikes = 0
     n_jump_recover_spikes = 0
+    n_plateau_candidates = 0
+    n_plateau_suppressed = 0
 
     plateau_tol = max(0.005, dt * cfg.depth_qc_max_slope_mps * 0.1)
+    jump_mag_threshold = max(0.03, plateau_tol * 6)
+    recovery_tol = max(0.01, plateau_tol * 3)
 
     for _, g in anomaly_groups:
         g_idx = g.index
@@ -692,24 +697,51 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
         seg_depth = depth.loc[g_idx]
         seg_range = float((seg_depth.max() - seg_depth.min())) if seg_depth.notna().any() else 0.0
         is_plateau_like = seg_range <= plateau_tol
+        if is_plateau_like:
+            n_plateau_candidates += 1
 
         has_slope_flag = bool(spike_mask_slope.loc[g_idx].any())
-        is_jump_recover = False
-        if len(g_idx) <= 3 and duration_sec < bad_segment_min_duration_sec and has_slope_flag:
-            if start_idx > 0 and end_idx < len(df) - 1:
-                pre_v = depth.iloc[start_idx - 1]
-                post_v = depth.iloc[end_idx + 1]
-                if pd.notna(pre_v) and pd.notna(post_v):
-                    is_jump_recover = abs(float(pre_v - post_v)) <= plateau_tol * 2
 
-        # 규칙: 충분히 길고 plateau 성격이 아닌 경우만 bad segment
-        if duration_sec >= bad_segment_min_duration_sec and not is_plateau_like:
+        pre_v = depth.iloc[start_idx - 1] if start_idx > 0 else pd.NA
+        post_v = depth.iloc[end_idx + 1] if end_idx < len(df) - 1 else pd.NA
+        has_prepost = pd.notna(pre_v) and pd.notna(post_v)
+
+        local_recovery = False
+        if has_prepost:
+            local_recovery = abs(float(pre_v - post_v)) <= recovery_tol
+
+        jump_mag = 0.0
+        if has_prepost and seg_depth.notna().any():
+            jump_mag = float(max((seg_depth - float(pre_v)).abs().max(), (seg_depth - float(post_v)).abs().max()))
+        elif seg_depth.notna().any():
+            jump_mag = float((seg_depth.max() - seg_depth.min()))
+
+        seg_diff = seg_depth.diff().dropna()
+        is_discontinuous_glitch = False
+        if not seg_diff.empty:
+            big_jumps = (seg_diff.abs() >= jump_mag_threshold * 0.5)
+            sign_flip = (seg_diff * seg_diff.shift(-1) < 0).fillna(False)
+            is_discontinuous_glitch = bool(big_jumps.sum() >= 2 and sign_flip.any())
+
+        # bad segment 승격: plateau가 아니고, 짧은 시간 내 jump/recover 또는 glitch 패턴일 때만 허용
+        promote_bad_segment = (
+            (not is_plateau_like)
+            and has_slope_flag
+            and (bad_segment_min_duration_sec <= duration_sec <= bad_segment_max_duration_sec)
+            and (jump_mag >= jump_mag_threshold)
+            and (local_recovery or is_discontinuous_glitch)
+        )
+
+        if promote_bad_segment:
             depth_flag_bad_segment.loc[g_idx] = True
             rec = {
                 "start_index": start_idx,
                 "end_index": end_idx,
                 "n_rows": int(len(g_idx)),
                 "duration_sec": duration_sec,
+                "jump_mag": jump_mag,
+                "local_recovery": bool(local_recovery),
+                "is_discontinuous_glitch": bool(is_discontinuous_glitch),
             }
             if "analysis_time" in df.columns:
                 rec["start_time"] = str(df.loc[start_idx, "analysis_time"])
@@ -717,15 +749,32 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
             bad_segment_rows.append(rec)
             continue
 
-        # 그 외는 spike 후보 우선: 단일점/짧은 jump-recover 우선 처리
+        # plateau/긴 계단 구간은 bad segment로 승격하지 않고, edge 1~2점만 spike 허용
+        if is_plateau_like:
+            n_plateau_suppressed += 1
+            edge_candidates = []
+            if bool(spike_mask_slope.loc[start_idx]):
+                edge_candidates.append(start_idx)
+            if bool(spike_mask_slope.loc[end_idx]) and end_idx != start_idx:
+                edge_candidates.append(end_idx)
+            if not edge_candidates and has_slope_flag:
+                edge_candidates = [start_idx] if start_idx == end_idx else [start_idx, end_idx]
+
+            for idx in edge_candidates[:2]:
+                depth_flag_spike.loc[idx] = True
+            if len(edge_candidates) == 1:
+                n_isolated_spikes += 1
+            continue
+
+        # 그 외는 spike 후보 우선: 단일점/짧은 jump-recover 패턴
         if len(g_idx) == 1:
             depth_flag_spike.loc[g_idx] = True
             n_isolated_spikes += 1
-        elif is_jump_recover:
-            depth_flag_spike.loc[g_idx] = True
-            n_jump_recover_spikes += int(len(g_idx))
+        elif local_recovery and jump_mag >= jump_mag_threshold:
+            for idx in list(g_idx)[:2]:
+                depth_flag_spike.loc[idx] = True
+                n_jump_recover_spikes += 1
         else:
-            # plateau/짧은 연속구간 과탐 완화: 대표 1점만 spike로 표기
             local_abs_dev = (depth.loc[g_idx] - rolling_median.loc[g_idx]).abs()
             rep_idx = int(local_abs_dev.fillna(-1).idxmax())
             depth_flag_spike.loc[rep_idx] = True
@@ -785,6 +834,9 @@ def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
         "bad_segment_min_duration_sec": bad_segment_min_duration_sec,
         "n_isolated_spikes": int(n_isolated_spikes),
         "n_jump_recover_spikes": int(n_jump_recover_spikes),
+        "n_plateau_candidates": int(n_plateau_candidates),
+        "n_plateau_suppressed": int(n_plateau_suppressed),
+        "n_bad_segments_after_plateau_filter": int(len(bad_segment_rows)),
         "bad_segment_rows": bad_segment_rows,
         "depth_std_before": depth_std_before,
         "depth_std_after": depth_std_after,
@@ -1263,6 +1315,8 @@ def main():
             print(f"  · n_bad_segments(short/long): {depth_qc_meta.get('n_bad_segments_short')} / {depth_qc_meta.get('n_bad_segments_long')}")
             print(f"  · bad_segment_min_duration_sec: {depth_qc_meta.get('bad_segment_min_duration_sec')}")
             print(f"  · n_isolated_spikes / n_jump_recover_spikes: {depth_qc_meta.get('n_isolated_spikes')} / {depth_qc_meta.get('n_jump_recover_spikes')}")
+            print(f"  · n_plateau_candidates / n_plateau_suppressed: {depth_qc_meta.get('n_plateau_candidates')} / {depth_qc_meta.get('n_plateau_suppressed')}")
+            print(f"  · n_bad_segments_after_plateau_filter: {depth_qc_meta.get('n_bad_segments_after_plateau_filter')}")
             print(f"  · std ratio (after/before): {depth_qc_meta.get('depth_std_ratio')}")
             print(f"  · extrema_flag_ratio: {depth_qc_meta.get('extrema_flag_ratio')}")
             print(f"  · max_abs_slope (m/s): {depth_qc_meta.get('max_abs_slope')}")
