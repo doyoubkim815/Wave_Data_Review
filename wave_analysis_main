@@ -1014,7 +1014,7 @@ def plot_depth_qc_review(df: pd.DataFrame, out_dir: Path, cfg: Config, qc_meta: 
 
     현재 구현
     - 탐지 후보가 있을 때만 review plot 생성
-    - 우선순위: union > jump_recover > slope > hampel
+    - 우선순위: jump_recover > slope > isolated_spikes > hampel > union
     - 같은 종류 내 대표성(밀집도/크기/지속시간) 기반으로 우선 선택
     """
     review_meta = {
@@ -1022,10 +1022,11 @@ def plot_depth_qc_review(df: pd.DataFrame, out_dir: Path, cfg: Config, qc_meta: 
         "saved_plots": [],
         "extrema_flag_ratio": qc_meta.get("extrema_flag_ratio"),
         "selected_plots_total": 0,
-        "selected_union": 0,
         "selected_jump_recover": 0,
         "selected_slope": 0,
+        "selected_isolated_spikes": 0,
         "selected_hampel": 0,
+        "selected_union": 0,
     }
 
     if not cfg.save_plot:
@@ -1040,11 +1041,13 @@ def plot_depth_qc_review(df: pd.DataFrame, out_dir: Path, cfg: Config, qc_meta: 
     hampel_mask = df.get("depth_flag_hampel", False).astype(bool)
     slope_mask = df.get("depth_flag_slope", False).astype(bool)
     jump_recover_mask = df.get("depth_flag_jump_recover", False).astype(bool)
+    spike_mask = df.get("depth_flag_spike", False).astype(bool)
 
     union_mask = hampel_mask | slope_mask
+    isolated_spike_mask = spike_mask & (~jump_recover_mask) & (~df.get("depth_flag_bad_segment", False).astype(bool))
 
     # 후보가 없으면 생성하지 않음
-    if not union_mask.any() and not jump_recover_mask.any():
+    if not (union_mask.any() or jump_recover_mask.any() or isolated_spike_mask.any()):
         return review_meta
 
     dt = float(cfg.expected_dt_sec)
@@ -1107,16 +1110,18 @@ def plot_depth_qc_review(df: pd.DataFrame, out_dir: Path, cfg: Config, qc_meta: 
     # -----------------------------------------------------
     # 2) 우선순위 기반 후보 구성
     # -----------------------------------------------------
-    cand_union = build_candidates(union_mask, "union")
     cand_jump = build_candidates(jump_recover_mask, "jump_recover")
     cand_slope = build_candidates(slope_mask, "slope")
+    cand_isolated = build_candidates(isolated_spike_mask, "isolated_spikes")
     cand_hampel = build_candidates(hampel_mask, "hampel")
+    cand_union = build_candidates(union_mask, "union")
 
     priority_buckets = [
-        ("union", cand_union),
         ("jump_recover", cand_jump),
         ("slope", cand_slope),
+        ("isolated_spikes", cand_isolated),
         ("hampel", cand_hampel),
+        ("union", cand_union),
     ]
 
     selected = []
@@ -1224,10 +1229,11 @@ def plot_depth_qc_review(df: pd.DataFrame, out_dir: Path, cfg: Config, qc_meta: 
     # -----------------------------------------------------
     selected_labels = [seg.get("label") for seg in selected]
     review_meta["selected_plots_total"] = int(len(selected_labels))
-    review_meta["selected_union"] = int(sum(1 for x in selected_labels if x == "union"))
     review_meta["selected_jump_recover"] = int(sum(1 for x in selected_labels if x == "jump_recover"))
     review_meta["selected_slope"] = int(sum(1 for x in selected_labels if x == "slope"))
+    review_meta["selected_isolated_spikes"] = int(sum(1 for x in selected_labels if x == "isolated_spikes"))
     review_meta["selected_hampel"] = int(sum(1 for x in selected_labels if x == "hampel"))
+    review_meta["selected_union"] = int(sum(1 for x in selected_labels if x == "union"))
 
     return review_meta
 
@@ -1433,7 +1439,7 @@ def main():
             print(f"  · selected segments: {len(depth_qc_review_meta.get('selected_segments', []))}")
             print(f"  · saved plots: {len(depth_qc_review_meta.get('saved_plots', []))}")
             print(f"  · selected_plots_total: {depth_qc_review_meta.get('selected_plots_total')}")
-            print(f"  · selected_union / jump_recover / slope / hampel: {depth_qc_review_meta.get('selected_union')} / {depth_qc_review_meta.get('selected_jump_recover')} / {depth_qc_review_meta.get('selected_slope')} / {depth_qc_review_meta.get('selected_hampel')}")
+            print(f"  · selected_jump_recover / slope / isolated_spikes / hampel / union: {depth_qc_review_meta.get('selected_jump_recover')} / {depth_qc_review_meta.get('selected_slope')} / {depth_qc_review_meta.get('selected_isolated_spikes')} / {depth_qc_review_meta.get('selected_hampel')} / {depth_qc_review_meta.get('selected_union')}")
 
         print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling, depth_qc까지 수행했습니다.")
         print("- 다음 단계에서는 run_detrend()를 구현하는 것이 가장 적절합니다.")
