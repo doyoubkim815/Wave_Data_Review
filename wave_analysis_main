@@ -1013,13 +1013,19 @@ def plot_depth_qc_review(df: pd.DataFrame, out_dir: Path, cfg: Config, qc_meta: 
     Depth QC 검증용 시각화/진단 모듈
 
     현재 구현
-    - 자동 구간 선택: longest bad segments 상위 3개 + flagged 밀집 구간 2개
-    - raw depth_m, flagged points, analysis_mask_time_domain=False 구간 표시
+    - 탐지 후보가 있을 때만 review plot 생성
+    - 우선순위: union > jump_recover > slope > hampel
+    - 같은 종류 내 대표성(밀집도/크기/지속시간) 기반으로 우선 선택
     """
     review_meta = {
         "selected_segments": [],
         "saved_plots": [],
         "extrema_flag_ratio": qc_meta.get("extrema_flag_ratio"),
+        "selected_plots_total": 0,
+        "selected_union": 0,
+        "selected_jump_recover": 0,
+        "selected_slope": 0,
+        "selected_hampel": 0,
     }
 
     if not cfg.save_plot:
@@ -1028,28 +1034,19 @@ def plot_depth_qc_review(df: pd.DataFrame, out_dir: Path, cfg: Config, qc_meta: 
     if cfg.depth_col not in df.columns:
         return review_meta
 
-    flagged_mask = (df.get("depth_flag_spike", False) | df.get("depth_flag_bad_segment", False)).astype(bool)
-    bad_mask = (~df.get("analysis_mask_time_domain", True)).astype(bool)
+    # -----------------------------------------------------
+    # 1) 마스크 준비
+    # -----------------------------------------------------
     hampel_mask = df.get("depth_flag_hampel", False).astype(bool)
     slope_mask = df.get("depth_flag_slope", False).astype(bool)
     jump_recover_mask = df.get("depth_flag_jump_recover", False).astype(bool)
 
-    selected = []
+    union_mask = hampel_mask | slope_mask
 
-    # -----------------------------------------------------
-    # 1) longest bad segments 상위 3개
-    # -----------------------------------------------------
-    bad_segments = sorted(qc_meta.get("bad_segment_rows", []), key=lambda x: x.get("duration_sec", 0.0), reverse=True)
-    for seg in bad_segments[:3]:
-        selected.append({
-            "start_index": int(seg.get("start_index", 0)),
-            "end_index": int(seg.get("end_index", 0)),
-            "label": "longest_bad_segment",
-        })
+    # 후보가 없으면 생성하지 않음
+    if not union_mask.any() and not jump_recover_mask.any():
+        return review_meta
 
-    # -----------------------------------------------------
-    # 2) flagged point 밀집 구간 2개
-    # -----------------------------------------------------
     dt = float(cfg.expected_dt_sec)
     if "analysis_time" in df.columns and len(df) >= 2:
         dt_series = df["analysis_time"].sort_values().diff().dt.total_seconds().dropna()
@@ -1058,46 +1055,104 @@ def plot_depth_qc_review(df: pd.DataFrame, out_dir: Path, cfg: Config, qc_meta: 
             dt = float(dt_series.median())
 
     window_n = max(5, int(round(10.0 / dt)))
-    density = flagged_mask.astype(int).rolling(window=window_n, center=True, min_periods=1).sum()
-    top_centers = density.sort_values(ascending=False).index.tolist()
 
-    used_centers = []
-    for c in top_centers:
-        if len(used_centers) >= 2:
+    def build_candidates(mask: pd.Series, criterion: str, max_candidates: int = 40):
+        if not mask.any():
+            return []
+
+        density = mask.astype(int).rolling(window=window_n, center=True, min_periods=1).sum()
+        centers = density.sort_values(ascending=False).index.tolist()
+
+        candidates = []
+        used = []
+        for c in centers:
+            if len(candidates) >= max_candidates:
+                break
+            c = int(c)
+            if any(abs(c - u) < window_n for u in used):
+                continue
+
+            s_idx = max(0, c - window_n // 2)
+            e_idx = min(len(df) - 1, c + window_n // 2)
+
+            part_mask = mask.iloc[s_idx:e_idx + 1]
+            if not part_mask.any():
+                continue
+
+            # 대표성 점수: 밀집도 + depth 변화 크기 + 시간 지속 길이
+            density_score = int(part_mask.sum())
+            y = pd.to_numeric(df.iloc[s_idx:e_idx + 1][cfg.depth_col], errors="coerce")
+            mag_score = float((y.max() - y.min())) if y.notna().any() else 0.0
+
+            if "analysis_time" in df.columns:
+                t0 = df.iloc[s_idx]["analysis_time"]
+                t1 = df.iloc[e_idx]["analysis_time"]
+                duration_score = float((t1 - t0).total_seconds())
+            else:
+                duration_score = float((e_idx - s_idx) * dt)
+
+            score = density_score * 10.0 + mag_score + duration_score
+            candidates.append(
+                {
+                    "start_index": int(s_idx),
+                    "end_index": int(e_idx),
+                    "label": criterion,
+                    "score": float(score),
+                }
+            )
+            used.append(c)
+
+        return candidates
+
+    # -----------------------------------------------------
+    # 2) 우선순위 기반 후보 구성
+    # -----------------------------------------------------
+    cand_union = build_candidates(union_mask, "union")
+    cand_jump = build_candidates(jump_recover_mask, "jump_recover")
+    cand_slope = build_candidates(slope_mask, "slope")
+    cand_hampel = build_candidates(hampel_mask, "hampel")
+
+    priority_buckets = [
+        ("union", cand_union),
+        ("jump_recover", cand_jump),
+        ("slope", cand_slope),
+        ("hampel", cand_hampel),
+    ]
+
+    selected = []
+    occupied = []
+    max_plots = 10
+
+    for criterion, bucket in priority_buckets:
+        if len(selected) >= max_plots:
             break
-        if any(abs(int(c) - uc) < window_n for uc in used_centers):
-            continue
-        used_centers.append(int(c))
 
-    for c in used_centers:
-        start_idx = max(0, c - window_n // 2)
-        end_idx = min(len(df) - 1, c + window_n // 2)
-        selected.append({
-            "start_index": int(start_idx),
-            "end_index": int(end_idx),
-            "label": "flag_density_window",
-        })
+        bucket = sorted(bucket, key=lambda x: x["score"], reverse=True)
+        for seg in bucket:
+            if len(selected) >= max_plots:
+                break
 
-    # 중복 구간 제거
-    uniq = []
-    seen = set()
-    for seg in selected:
-        key = (seg["start_index"], seg["end_index"], seg["label"])
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append(seg)
+            s_idx = int(seg["start_index"])
+            e_idx = int(seg["end_index"])
+            if any(not (e_idx < os or s_idx > oe) for os, oe in occupied):
+                continue
 
-    review_meta["selected_segments"] = uniq
+            selected.append(seg)
+            occupied.append((s_idx, e_idx))
+
+    review_meta["selected_segments"] = selected
 
     # -----------------------------------------------------
     # 3) 구간별 그래프 저장
     # -----------------------------------------------------
-    for i, seg in enumerate(uniq, start=1):
-        s_idx = seg["start_index"]
-        e_idx = seg["end_index"]
-        part = df.iloc[s_idx:e_idx + 1].copy()
+    bad_mask = (~df.get("analysis_mask_time_domain", True)).astype(bool)
 
+    for i, seg in enumerate(selected, start=1):
+        s_idx = int(seg["start_index"])
+        e_idx = int(seg["end_index"])
+        criterion = seg["label"]
+
+        part = df.iloc[s_idx:e_idx + 1].copy()
         if part.empty:
             continue
 
@@ -1149,7 +1204,7 @@ def plot_depth_qc_review(df: pd.DataFrame, out_dir: Path, cfg: Config, qc_meta: 
                 x1 = x.iloc[ge]
                 ax.axvspan(x0, x1, color="orange", alpha=0.25, label="analysis_mask_time_domain=False")
 
-        ax.set_title(f"Depth QC Review #{i} ({seg['label']})")
+        ax.set_title(f"Depth QC Review #{i} [{criterion}]")
         ax.set_xlabel("time")
         ax.set_ylabel("depth_m")
         handles, labels = ax.get_legend_handles_labels()
@@ -1157,15 +1212,24 @@ def plot_depth_qc_review(df: pd.DataFrame, out_dir: Path, cfg: Config, qc_meta: 
         ax.legend(by_label.values(), by_label.keys(), loc="best")
         ax.grid(alpha=0.3)
 
-        output_path = out_dir / f"depth_qc_review_{i:02d}.png"
+        output_path = out_dir / f"depth_qc_review_{i:02d}_{criterion}.png"
         fig.tight_layout()
         fig.savefig(output_path, dpi=150)
         plt.close(fig)
 
         review_meta["saved_plots"].append(str(output_path))
 
-    return review_meta
+    # -----------------------------------------------------
+    # 4) 선택 결과 메타 집계
+    # -----------------------------------------------------
+    selected_labels = [seg.get("label") for seg in selected]
+    review_meta["selected_plots_total"] = int(len(selected_labels))
+    review_meta["selected_union"] = int(sum(1 for x in selected_labels if x == "union"))
+    review_meta["selected_jump_recover"] = int(sum(1 for x in selected_labels if x == "jump_recover"))
+    review_meta["selected_slope"] = int(sum(1 for x in selected_labels if x == "slope"))
+    review_meta["selected_hampel"] = int(sum(1 for x in selected_labels if x == "hampel"))
 
+    return review_meta
 
 def plot_time_domain_stats(td_stats_df: pd.DataFrame, out_dir: Path, cfg: Config):
     """
@@ -1368,6 +1432,8 @@ def main():
             print("- Depth QC Review 요약:")
             print(f"  · selected segments: {len(depth_qc_review_meta.get('selected_segments', []))}")
             print(f"  · saved plots: {len(depth_qc_review_meta.get('saved_plots', []))}")
+            print(f"  · selected_plots_total: {depth_qc_review_meta.get('selected_plots_total')}")
+            print(f"  · selected_union / jump_recover / slope / hampel: {depth_qc_review_meta.get('selected_union')} / {depth_qc_review_meta.get('selected_jump_recover')} / {depth_qc_review_meta.get('selected_slope')} / {depth_qc_review_meta.get('selected_hampel')}")
 
         print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling, depth_qc까지 수행했습니다.")
         print("- 다음 단계에서는 run_detrend()를 구현하는 것이 가장 적절합니다.")
