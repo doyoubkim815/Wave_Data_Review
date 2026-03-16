@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 
@@ -74,6 +75,12 @@ class Config:
     depth_qc_n_sigma: float = 8.0
     depth_qc_max_slope_mps: float = 3.0
 
+    # detrend 파라미터
+    detrend_tide_cutoff_sec: float = 1800.0
+    detrend_short_band_sec: Tuple[float, float] = (2.0, 25.0)
+    detrend_ig_band_sec: Tuple[float, float] = (25.0, 300.0)
+    detrend_zero_phase: bool = True
+
     # depth 제외 정책 스위치
     exclude_jump_recover_candidates: bool = False
     exclude_bad_segments: bool = False
@@ -101,6 +108,7 @@ class Config:
     save_plot: bool = True
     save_excluded_raw_txt: bool = True     # 처리 제외 raw 행 텍스트 저장 ON/OFF
     excluded_raw_txt_name: str = "excluded_raw_rows.txt"
+    save_decomposed_series_csv: bool = False
 
 
 # =========================================================
@@ -916,12 +924,127 @@ def run_detrend(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     """
     기준수면 제거 모듈
 
-    향후 구현 예정
-    - rolling mean
-    - low-frequency trend 제거
-    - eta(수면변위) 생성
+    구현 내용
+    - eta_centered: 평균 제거
+    - eta_tide: 저주파(조석 성분)
+    - eta_detrended: centered - tide
+    - eta_short: 단주기 대역(기본 2~25s)
+    - eta_ig: IG 대역(기본 25~300s)
+
+    필터 우선순위
+    1) scipy.signal (butter + filtfilt/sosfilt)
+    2) 실패 시 rolling 기반 fallback
     """
-    raise NotImplementedError("run_detrend()는 다음 단계에서 구현 예정입니다.")
+    df = df.copy()
+
+    if cfg.depth_col not in df.columns:
+        raise KeyError(f"필수 컬럼이 없습니다: {cfg.depth_col}")
+
+    depth = pd.to_numeric(df[cfg.depth_col], errors="coerce")
+    if not depth.notna().any():
+        raise ValueError("depth 시계열이 모두 결측입니다.")
+
+    dt_sec = float(cfg.expected_dt_sec)
+    if "analysis_time" in df.columns and len(df) >= 2:
+        dt = df["analysis_time"].diff().dt.total_seconds()
+        dt = dt[(dt > 0) & dt.notna()]
+        if not dt.empty:
+            dt_sec = float(dt.median())
+
+    fs = 1.0 / dt_sec if dt_sec > 0 else 1.0
+    nyq = 0.5 * fs
+
+    eta_centered = depth - depth.mean(skipna=True)
+
+    tide_cutoff_sec = float(cfg.detrend_tide_cutoff_sec)
+    short_band_sec = (float(cfg.detrend_short_band_sec[0]), float(cfg.detrend_short_band_sec[1]))
+    ig_band_sec = (float(cfg.detrend_ig_band_sec[0]), float(cfg.detrend_ig_band_sec[1]))
+
+    filter_method = "rolling_fallback"
+
+    def _rolling_lowpass(s: pd.Series, cutoff_sec: float) -> pd.Series:
+        win = max(3, int(round(cutoff_sec / dt_sec)))
+        if win % 2 == 0:
+            win += 1
+        return s.rolling(window=win, center=bool(cfg.detrend_zero_phase), min_periods=1).mean()
+
+    def _rolling_bandpass(s: pd.Series, band_sec: Tuple[float, float]) -> pd.Series:
+        p_min, p_max = sorted(band_sec)
+        # 고역통과(느린 성분 제거)
+        slow = _rolling_lowpass(s, p_max)
+        hp = s - slow
+        # 저역통과(너무 빠른 성분 완화)
+        return _rolling_lowpass(hp, p_min)
+
+    eta_tide = _rolling_lowpass(eta_centered, tide_cutoff_sec)
+    eta_detrended = eta_centered - eta_tide
+    eta_short = _rolling_bandpass(eta_detrended, short_band_sec)
+    eta_ig = _rolling_bandpass(eta_detrended, ig_band_sec)
+
+    try:
+        from scipy import signal
+
+        def _to_numpy_filled(s: pd.Series) -> np.ndarray:
+            return s.interpolate(limit_direction="both").fillna(0.0).to_numpy(dtype=float)
+
+        def _apply_sos(sos, x: np.ndarray) -> np.ndarray:
+            if cfg.detrend_zero_phase:
+                return signal.sosfiltfilt(sos, x)
+            return signal.sosfilt(sos, x)
+
+        x = _to_numpy_filled(eta_centered)
+
+        # 저역통과(조석)
+        tide_fc = 1.0 / tide_cutoff_sec
+        tide_fc = min(max(tide_fc, 1e-9), nyq * 0.95)
+        sos_tide = signal.butter(4, tide_fc, btype="lowpass", fs=fs, output="sos")
+        eta_tide_np = _apply_sos(sos_tide, x)
+        eta_detrended_np = x - eta_tide_np
+
+        def _band_period_to_freq(period_band_sec: Tuple[float, float]) -> Tuple[float, float]:
+            p1, p2 = sorted(period_band_sec)
+            # period가 길수록 저주파
+            low_f = 1.0 / p2
+            high_f = 1.0 / p1
+            low_f = min(max(low_f, 1e-9), nyq * 0.95)
+            high_f = min(max(high_f, low_f * 1.05), nyq * 0.98)
+            return low_f, high_f
+
+        short_f = _band_period_to_freq(short_band_sec)
+        ig_f = _band_period_to_freq(ig_band_sec)
+
+        sos_short = signal.butter(4, short_f, btype="bandpass", fs=fs, output="sos")
+        sos_ig = signal.butter(4, ig_f, btype="bandpass", fs=fs, output="sos")
+
+        eta_short_np = _apply_sos(sos_short, eta_detrended_np)
+        eta_ig_np = _apply_sos(sos_ig, eta_detrended_np)
+
+        eta_tide = pd.Series(eta_tide_np, index=df.index)
+        eta_detrended = pd.Series(eta_detrended_np, index=df.index)
+        eta_short = pd.Series(eta_short_np, index=df.index)
+        eta_ig = pd.Series(eta_ig_np, index=df.index)
+        filter_method = "scipy.signal.butter+sosfiltfilt" if cfg.detrend_zero_phase else "scipy.signal.butter+sosfilt"
+
+    except Exception:
+        # scipy 미설치/필터 실패 시 rolling fallback 유지
+        pass
+
+    df["eta_centered"] = eta_centered
+    df["eta_tide"] = eta_tide
+    df["eta_detrended"] = eta_detrended
+    df["eta_short"] = eta_short
+    df["eta_ig"] = eta_ig
+
+    detrend_meta = {
+        "dt_sec": float(dt_sec),
+        "tide_cutoff_sec": tide_cutoff_sec,
+        "short_band_sec": [short_band_sec[0], short_band_sec[1]],
+        "ig_band_sec": [ig_band_sec[0], ig_band_sec[1]],
+        "zero_phase": bool(cfg.detrend_zero_phase),
+        "filter_method": filter_method,
+    }
+
+    return df, detrend_meta
 
 
 # =========================================================
@@ -1285,6 +1408,74 @@ def plot_depth_qc_review(df: pd.DataFrame, out_dir: Path, cfg: Config, qc_meta: 
 
     return review_meta
 
+
+def plot_detrend_review(df: pd.DataFrame, out_dir: Path, cfg: Config) -> Dict:
+    """
+    Detrend 검증용 시각화
+
+    생성 그래프
+    - 짧은 구간 확대: depth / eta_short / eta_ig
+    - 전체 구간: eta_tide
+    """
+    review_meta = {
+        "saved_plots": [],
+    }
+
+    if not cfg.save_plot:
+        return review_meta
+
+    required_cols = [cfg.depth_col, "eta_short", "eta_ig", "eta_tide"]
+    if any(col not in df.columns for col in required_cols):
+        return review_meta
+
+    x = df["analysis_time"] if "analysis_time" in df.columns else df.index
+
+    # 1) 짧은 구간 확대
+    dt_sec = float(cfg.expected_dt_sec)
+    if "analysis_time" in df.columns and len(df) >= 2:
+        dt = df["analysis_time"].diff().dt.total_seconds()
+        dt = dt[(dt > 0) & dt.notna()]
+        if not dt.empty:
+            dt_sec = float(dt.median())
+    zoom_n = max(100, int(round(180.0 / dt_sec)))
+    zoom_n = min(zoom_n, len(df))
+
+    fig, ax = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+    ax[0].plot(x.iloc[:zoom_n] if hasattr(x, "iloc") else x[:zoom_n], df[cfg.depth_col].iloc[:zoom_n], color="black", linewidth=0.9)
+    ax[0].set_ylabel("depth")
+    ax[0].grid(alpha=0.3)
+
+    ax[1].plot(x.iloc[:zoom_n] if hasattr(x, "iloc") else x[:zoom_n], df["eta_short"].iloc[:zoom_n], color="tab:blue", linewidth=0.9)
+    ax[1].set_ylabel("eta_short")
+    ax[1].grid(alpha=0.3)
+
+    ax[2].plot(x.iloc[:zoom_n] if hasattr(x, "iloc") else x[:zoom_n], df["eta_ig"].iloc[:zoom_n], color="tab:green", linewidth=0.9)
+    ax[2].set_ylabel("eta_ig")
+    ax[2].grid(alpha=0.3)
+    ax[2].set_xlabel("time")
+
+    fig.suptitle("Detrend Review (Zoom): depth / eta_short / eta_ig")
+    fig.tight_layout()
+    zoom_path = out_dir / "detrend_review_zoom.png"
+    fig.savefig(zoom_path, dpi=150)
+    plt.close(fig)
+    review_meta["saved_plots"].append(str(zoom_path))
+
+    # 2) 전체 eta_tide
+    fig, ax = plt.subplots(figsize=(12, 3.5))
+    ax.plot(x, df["eta_tide"], color="tab:orange", linewidth=0.8)
+    ax.set_title("Detrend Review (Full): eta_tide")
+    ax.set_ylabel("eta_tide")
+    ax.set_xlabel("time")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    tide_path = out_dir / "detrend_review_eta_tide_full.png"
+    fig.savefig(tide_path, dpi=150)
+    plt.close(fig)
+    review_meta["saved_plots"].append(str(tide_path))
+
+    return review_meta
+
 def plot_time_domain_stats(td_stats_df: pd.DataFrame, out_dir: Path, cfg: Config):
     """
     시간영역 통계 그래프 저장 모듈
@@ -1371,9 +1562,18 @@ def run_pipeline(file_path: Path, cfg: Config, out_dir: Path) -> AnalysisResults
         review_meta = plot_depth_qc_review(df, out_dir, cfg, meta)
         log_meta(results, "depth_qc_review", review_meta)
 
-    # if cfg.run_detrend:
-    #     df, meta = run_detrend(df, cfg)
-    #     log_meta(results, "detrend", meta)
+    if cfg.run_detrend:
+        df, meta = run_detrend(df, cfg)
+        log_meta(results, "detrend", meta)
+
+        detrend_review_meta = plot_detrend_review(df, out_dir, cfg)
+        log_meta(results, "detrend_review", detrend_review_meta)
+
+        if cfg.save_decomposed_series_csv:
+            out_cols = ["analysis_time", cfg.depth_col, "eta_centered", "eta_tide", "eta_detrended", "eta_short", "eta_ig"]
+            out_cols = [c for c in out_cols if c in df.columns]
+            save_table(df[out_cols], out_dir, "decomposed_series.csv")
+            results.meta.setdefault("detrend", {})["decomposed_series_csv"] = str(out_dir / "decomposed_series.csv")
     #
     # if cfg.run_wave_detection:
     #     waves_df, meta = detect_individual_waves(df, cfg)
@@ -1505,8 +1705,21 @@ def main():
             print(f"  · selected_plots_total: {depth_qc_review_meta.get('selected_plots_total')}")
             print(f"  · selected_jump_recover / slope / isolated_spikes / hampel / union: {depth_qc_review_meta.get('selected_jump_recover')} / {depth_qc_review_meta.get('selected_slope')} / {depth_qc_review_meta.get('selected_isolated_spikes')} / {depth_qc_review_meta.get('selected_hampel')} / {depth_qc_review_meta.get('selected_union')}")
 
-        print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling, depth_qc까지 수행했습니다.")
-        print("- 다음 단계에서는 run_detrend()를 구현하는 것이 가장 적절합니다.")
+        detrend_meta = results.meta.get("detrend", {})
+        if detrend_meta:
+            print("- Detrend 요약:")
+            print(f"  · tide_cutoff_sec: {detrend_meta.get('tide_cutoff_sec')}")
+            print(f"  · short_band: {detrend_meta.get('short_band_sec')}")
+            print(f"  · ig_band: {detrend_meta.get('ig_band_sec')}")
+            print(f"  · zero_phase: {detrend_meta.get('zero_phase')}")
+            print(f"  · filter_method: {detrend_meta.get('filter_method')}")
+
+        detrend_review_meta = results.meta.get("detrend_review", {})
+        if detrend_review_meta:
+            print("- Detrend Review 요약:")
+            print(f"  · saved plots: {len(detrend_review_meta.get('saved_plots', []))}")
+
+        print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling, depth_qc, detrend까지 수행했습니다.")
 
     except Exception as e:
         print("\n[오류 발생]")
