@@ -14,9 +14,8 @@
 2) csv / xlsx 파일 읽기
 3) 컬럼명 정규화
 4) time_local 기반 공통 시간축 생성
-5) epoch_sec 보조 검증
-6) 출력 폴더 생성
-7) metadata 저장
+5) 출력 폴더 생성
+6) metadata 저장
 
 향후 추가 예정
 - 시간축 QA (dt, gap, duplicate, missing)
@@ -39,6 +38,8 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 
@@ -59,7 +60,6 @@ class Config:
     # 1-1. 입력 파일 표준 컬럼명
     # -----------------------------------------------------
     time_col: str = "time_local"          # 주 분석 시간축 컬럼
-    epoch_col: str = "epoch_sec"          # 보조 검증용 epoch 컬럼
     depth_col: str = "depth_m"            # 수면 높이 또는 수심 계측값
     wind_dir_col: str = "wind_dir_deg"    # 풍향 (현재는 읽기만 함)
     wind_speed_col: str = "wind_speed"    # 풍속 (현재는 읽기만 함)
@@ -68,6 +68,23 @@ class Config:
     # 1-2. 샘플링 관련
     # -----------------------------------------------------
     expected_dt_sec: float = 0.1          # 기대 샘플링 간격(초)
+
+    # depth QC 파라미터
+    depth_qc_method: str = "hampel"
+    depth_qc_window_sec: float = 6.0
+    depth_qc_n_sigma: float = 8.0
+    depth_qc_max_slope_mps: float = 3.0
+
+    # detrend 파라미터
+    detrend_tide_cutoff_sec: float = 1800.0
+    detrend_short_band_sec: Tuple[float, float] = (2.0, 25.0)
+    detrend_ig_band_sec: Tuple[float, float] = (25.0, 300.0)
+    detrend_zero_phase: bool = True
+
+    # depth 제외 정책 스위치
+    exclude_jump_recover_candidates: bool = False
+    exclude_bad_segments: bool = False
+    exclude_isolated_spikes: bool = False
 
     # -----------------------------------------------------
     # 1-3. 분석 기능 ON / OFF
@@ -89,6 +106,9 @@ class Config:
     output_root: str = "outputs"          # 결과 저장 루트 폴더
     save_csv: bool = True
     save_plot: bool = True
+    save_excluded_raw_txt: bool = True     # 처리 제외 raw 행 텍스트 저장 ON/OFF
+    excluded_raw_txt_name: str = "excluded_raw_rows.txt"
+    save_decomposed_series_csv: bool = False
 
 
 # =========================================================
@@ -196,7 +216,7 @@ def prompt_input_file() -> Path:
     return file_path
 
 
-def load_input_file(file_path: Path, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+def load_input_file(file_path: Path, cfg: Config, out_dir: Optional[Path] = None) -> Tuple[pd.DataFrame, Dict]:
     """
     입력 파일을 읽고, 컬럼명 정규화 및 시간축 생성까지 수행한다.
 
@@ -223,7 +243,15 @@ def load_input_file(file_path: Path, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     # -----------------------------------------------------
     # 3) 공통 시간축 생성
     # -----------------------------------------------------
-    df, time_meta = ensure_time_axis(df, cfg)
+    df, time_meta, excluded_rows_df = ensure_time_axis(df, cfg)
+
+    if cfg.save_excluded_raw_txt and out_dir is not None:
+        excluded_txt_path = save_excluded_rows_txt(
+            excluded_rows_df,
+            out_dir,
+            cfg.excluded_raw_txt_name,
+        )
+        time_meta["excluded_raw_txt"] = str(excluded_txt_path)
 
     # -----------------------------------------------------
     # 4) 로드 메타정보 정리
@@ -250,7 +278,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     목적
     - 대소문자 차이 제거
     - 공백 / 특수문자 차이 완화
-    - 자주 발생하는 컬럼명 변형을 표준명으로 통일
 
     예
     - ' Time Local ' -> 'time_local'
@@ -274,50 +301,29 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
     df.columns = normalized
-
-    # -----------------------------------------------------
-    # 자주 발생하는 별칭을 표준 컬럼명으로 통일
-    # -----------------------------------------------------
-    rename_map = {}
-
-    alias_map = {
-        "time_local": ["time_local", "local_time", "time", "datetime_local"],
-        "epoch_sec": ["epoch_sec", "epoch", "unix_time", "timestamp_sec"],
-        "depth_m": ["depth_m", "depth", "water_level", "level_m", "surface_elevation"],
-        "wind_dir_deg": ["wind_dir_deg", "wind_dir", "wind_direction", "wind_direction_deg"],
-        "wind_speed": ["wind_speed", "wind_speed_ms", "wind_vel", "windspeed"],
-    }
-
-    for standard_name, alias_list in alias_map.items():
-        for alias in alias_list:
-            if alias in df.columns:
-                rename_map[alias] = standard_name
-                break
-
-    df = df.rename(columns=rename_map)
     return df
 
 
-def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict, pd.DataFrame]:
     """
     분석용 공통 시간축 analysis_time 을 생성한다.
 
     설계 원칙
     - 현재 raw 데이터 구조에서는 time_local이 날짜+시각+소수초를 포함하므로
       이를 주 분석 시간축으로 사용한다.
-    - epoch_sec는 주 시간축으로 사용하지 않고, 보조 검증용으로만 활용한다.
 
     반환
     - df
     - time_meta
     """
     df = df.copy()
+    df["raw_row_index"] = df.index
 
     # -----------------------------------------------------
     # 1) 숫자형 컬럼 변환
     # 수치 연산이 필요한 컬럼은 미리 숫자형으로 변환
     # -----------------------------------------------------
-    numeric_cols = [cfg.epoch_col, cfg.depth_col, cfg.wind_dir_col, cfg.wind_speed_col]
+    numeric_cols = [cfg.depth_col, cfg.wind_dir_col, cfg.wind_speed_col]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -344,74 +350,79 @@ def ensure_time_axis(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]
     df["analysis_time"] = parsed_time_local
 
     # -----------------------------------------------------
-    # 3) analysis_time 결측 제거
+    # 3) 처리 제외 규칙 마스크 생성
+    # - invalid_time: analysis_time 파싱 실패
+    # - invalid_depth: depth_m 결측/0.0
+    # - duplicate_time: 유효 시간/유효 depth 대상 중 중복 analysis_time (첫 행 제외)
     # -----------------------------------------------------
-    before_drop_na = len(df)
-    df = df.dropna(subset=["analysis_time"]).copy()
-    after_drop_na = len(df)
+    invalid_time_mask = df["analysis_time"].isna()
 
-    # -----------------------------------------------------
-    # 4) 시간순 정렬
-    # -----------------------------------------------------
-    df = df.sort_values("analysis_time").reset_index(drop=True)
-
-    # -----------------------------------------------------
-    # 5) 중복 시간 제거
-    # 동일한 analysis_time이 있으면 첫 행만 유지
-    # -----------------------------------------------------
-    before_drop_dup = len(df)
-    df = df.drop_duplicates(subset=["analysis_time"], keep="first").reset_index(drop=True)
-    after_drop_dup = len(df)
-
-    # -----------------------------------------------------
-    # 6) 필수 컬럼 존재 확인
-    # 현재 단계에서 최소 depth_m 은 반드시 있어야 함
-    # -----------------------------------------------------
     if cfg.depth_col not in df.columns:
         raise KeyError(f"필수 컬럼이 없습니다: {cfg.depth_col}")
+    invalid_depth_mask = df[cfg.depth_col].isna() | (df[cfg.depth_col] == 0)
+
+    eligible_for_duplicate = (~invalid_time_mask) & (~invalid_depth_mask)
+    duplicate_time_mask = pd.Series(False, index=df.index)
+
+    dedup_target = df.loc[eligible_for_duplicate].sort_values(
+        by=["analysis_time", "raw_row_index"],
+        kind="mergesort",
+    )
+    duplicated_in_target = dedup_target.duplicated(subset=["analysis_time"], keep="first")
+    duplicate_time_mask.loc[dedup_target.index] = duplicated_in_target
+
+    excluded_mask = invalid_time_mask | invalid_depth_mask | duplicate_time_mask
 
     # -----------------------------------------------------
-    # 7) epoch_sec 보조 검증
-    # time_local과 epoch_sec가 둘 다 있으면 차이를 계산하여 QA용 정보로 기록
+    # 4) 처리 제외 raw 행 구성 (중복 사유 동시 표기)
     # -----------------------------------------------------
-    epoch_check = {
-        "epoch_check_performed": False,
-        "epoch_valid_ratio": None,
-        "epoch_vs_time_local_mean_abs_diff_sec": None,
-        "epoch_vs_time_local_max_abs_diff_sec": None,
-    }
+    excluded_rows_df = df.loc[excluded_mask].copy()
+    excluded_rows_df["excluded_by_invalid_time"] = invalid_time_mask.loc[excluded_rows_df.index]
+    excluded_rows_df["excluded_by_duplicate_time"] = duplicate_time_mask.loc[excluded_rows_df.index]
+    excluded_rows_df["excluded_by_invalid_depth"] = invalid_depth_mask.loc[excluded_rows_df.index]
 
-    if cfg.epoch_col in df.columns:
-        epoch_valid_ratio = df[cfg.epoch_col].notna().mean()
-        epoch_check["epoch_valid_ratio"] = float(epoch_valid_ratio)
+    def _join_reasons(row) -> str:
+        reasons = []
+        if row["excluded_by_invalid_time"]:
+            reasons.append("invalid_time")
+        if row["excluded_by_duplicate_time"]:
+            reasons.append("duplicate_analysis_time")
+        if row["excluded_by_invalid_depth"]:
+            reasons.append("invalid_depth_missing_or_zero")
+        return ";".join(reasons)
 
-        if epoch_valid_ratio > 0.95:
-            epoch_time = pd.to_datetime(df[cfg.epoch_col], unit="s", errors="coerce")
-            valid_mask = epoch_time.notna() & df["analysis_time"].notna()
-
-            if valid_mask.any():
-                diff_sec = (
-                    df.loc[valid_mask, "analysis_time"].astype("int64") / 1e9
-                    - epoch_time.loc[valid_mask].astype("int64") / 1e9
-                ).abs()
-
-                epoch_check["epoch_check_performed"] = True
-                epoch_check["epoch_vs_time_local_mean_abs_diff_sec"] = float(diff_sec.mean())
-                epoch_check["epoch_vs_time_local_max_abs_diff_sec"] = float(diff_sec.max())
+    excluded_rows_df["exclusion_reason"] = excluded_rows_df.apply(_join_reasons, axis=1)
+    excluded_rows_df["exclusion_reason_count"] = (
+        excluded_rows_df[[
+            "excluded_by_invalid_time",
+            "excluded_by_duplicate_time",
+            "excluded_by_invalid_depth",
+        ]].sum(axis=1)
+    )
 
     # -----------------------------------------------------
-    # 8) 시간축 메타정보 정리
+    # 5) 유효 데이터만 유지 후 시간순 정렬
     # -----------------------------------------------------
+    df = df.loc[~excluded_mask].copy()
+    df = df.sort_values(by=["analysis_time", "raw_row_index"], kind="mergesort").reset_index(drop=True)
+
+    # -----------------------------------------------------
+    # 6) 시간축 메타정보 정리
+    # -----------------------------------------------------
+    multi_reason_rows = int((excluded_rows_df["exclusion_reason_count"] > 1).sum()) if not excluded_rows_df.empty else 0
+
     time_meta = {
         "time_axis_source": "time_local",
         "analysis_time_start": str(df["analysis_time"].min()),
         "analysis_time_end": str(df["analysis_time"].max()),
-        "rows_dropped_due_to_invalid_time": int(before_drop_na - after_drop_na),
-        "rows_dropped_due_to_duplicate_time": int(before_drop_dup - after_drop_dup),
-        **epoch_check,
+        "pre_clean_rows_dropped_due_to_invalid_time": int(invalid_time_mask.sum()),
+        "pre_clean_rows_dropped_due_to_duplicate_time": int(duplicate_time_mask.sum()),
+        "pre_clean_rows_dropped_due_to_invalid_depth": int(invalid_depth_mask.sum()),
+        "pre_clean_rows_excluded_total_unique": int(excluded_mask.sum()),
+        "pre_clean_rows_excluded_with_multiple_reasons": multi_reason_rows,
     }
 
-    return df, time_meta
+    return df.drop(columns=["raw_row_index"]), time_meta, excluded_rows_df.reset_index(drop=True)
 
 
 def make_output_dir(file_path: Path, cfg: Config) -> Path:
@@ -447,37 +458,593 @@ def run_timebase_qa(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     """
     시간축 품질 점검 모듈
 
-    향후 구현 예정
+    현재 구현
     - 실제 dt 분포 계산
     - 기대 dt(0.1s) 대비 편차
     - gap / duplicate / missing 구간 진단
     - 시간축 품질 메타정보 출력
     """
-    raise NotImplementedError("run_timebase_qa()는 다음 단계에서 구현 예정입니다.")
+    if "analysis_time" not in df.columns:
+        raise KeyError("run_timebase_qa() 실행을 위해 'analysis_time' 컬럼이 필요합니다.")
+
+    qa_meta = {
+        "post_clean_expected_dt_sec": float(cfg.expected_dt_sec),
+        "post_clean_n_rows": int(len(df)),
+        "post_clean_n_intervals": 0,
+        "post_clean_dt_mean_sec": None,
+        "post_clean_dt_std_sec": None,
+        "post_clean_dt_min_sec": None,
+        "post_clean_dt_q05_sec": None,
+        "post_clean_dt_median_sec": None,
+        "post_clean_dt_q95_sec": None,
+        "post_clean_dt_max_sec": None,
+        "post_clean_dt_abs_diff_mean_sec": None,
+        "post_clean_dt_abs_diff_max_sec": None,
+        "post_clean_n_duplicate_intervals": 0,
+        "post_clean_n_non_increasing_intervals": 0,
+        "post_clean_n_gap_intervals": 0,
+        "post_clean_gap_intervals": [],
+        "gap_rows": [],
+        "post_clean_estimated_missing_samples": 0,
+        "post_clean_n_large_dt_deviation": 0,
+    }
+
+    if len(df) < 2:
+        return df, qa_meta
+
+    # -----------------------------------------------------
+    # 1) dt 계산
+    # -----------------------------------------------------
+    work = df[["analysis_time"]].sort_values("analysis_time").reset_index(drop=True)
+    dt_series = work["analysis_time"].diff().dt.total_seconds()
+    dt_sec = dt_series.dropna()
+
+    qa_meta["post_clean_n_intervals"] = int(len(dt_sec))
+
+    # -----------------------------------------------------
+    # 2) dt 분포 요약 통계
+    # -----------------------------------------------------
+    qa_meta["post_clean_dt_mean_sec"] = float(dt_sec.mean())
+    qa_meta["post_clean_dt_std_sec"] = float(dt_sec.std(ddof=0))
+    qa_meta["post_clean_dt_min_sec"] = float(dt_sec.min())
+    qa_meta["post_clean_dt_q05_sec"] = float(dt_sec.quantile(0.05))
+    qa_meta["post_clean_dt_median_sec"] = float(dt_sec.median())
+    qa_meta["post_clean_dt_q95_sec"] = float(dt_sec.quantile(0.95))
+    qa_meta["post_clean_dt_max_sec"] = float(dt_sec.max())
+
+    # -----------------------------------------------------
+    # 3) expected_dt 대비 편차 통계
+    # -----------------------------------------------------
+    expected_dt = float(cfg.expected_dt_sec)
+    abs_diff = (dt_sec - expected_dt).abs()
+    qa_meta["post_clean_dt_abs_diff_mean_sec"] = float(abs_diff.mean())
+    qa_meta["post_clean_dt_abs_diff_max_sec"] = float(abs_diff.max())
+
+    # -----------------------------------------------------
+    # 4) gap / duplicate / missing 진단
+    # -----------------------------------------------------
+    duplicate_mask = dt_sec == 0
+    non_increasing_mask = dt_sec <= 0
+    gap_mask = dt_sec > expected_dt * 1.5
+    large_deviation_mask = abs_diff > expected_dt * 0.5
+
+    qa_meta["post_clean_n_duplicate_intervals"] = int(duplicate_mask.sum())
+    qa_meta["post_clean_n_non_increasing_intervals"] = int(non_increasing_mask.sum())
+    qa_meta["post_clean_n_gap_intervals"] = int(gap_mask.sum())
+    qa_meta["post_clean_n_large_dt_deviation"] = int(large_deviation_mask.sum())
+
+    gap_rows = dt_sec[gap_mask]
+    gap_records = []
+    for curr_idx, curr_dt in gap_rows.items():
+        gap_records.append(
+            {
+                "index": int(curr_idx),
+                "time": str(work.loc[curr_idx, "analysis_time"]),
+                "dt_sec": float(curr_dt),
+            }
+        )
+    qa_meta["post_clean_gap_intervals"] = gap_records
+    qa_meta["gap_rows"] = gap_records
+
+    if expected_dt > 0:
+        estimated_missing = ((dt_sec[gap_mask] / expected_dt).round() - 1).clip(lower=0).sum()
+        qa_meta["post_clean_estimated_missing_samples"] = int(estimated_missing)
+
+    return df, qa_meta
+
+
+def run_gap_handling(df: pd.DataFrame, cfg: Config, qa_meta: Dict) -> Tuple[pd.DataFrame, Dict]:
+    """
+    gap 구간 분류 모듈
+
+    현재 구현
+    - run_timebase_qa()의 gap_rows를 입력으로 받음
+    - short gap / long gap 분류
+    - 실제 보간/수정 없이 목록화만 수행
+    """
+    gap_rows = qa_meta.get("gap_rows", [])
+
+    short_gap_rows = []
+    long_gap_rows = []
+
+    for row in gap_rows:
+        dt_sec = row.get("dt_sec")
+
+        if dt_sec is None:
+            continue
+
+        if dt_sec <= 0.3:
+            short_gap_rows.append(row)
+        else:
+            long_gap_rows.append(row)
+
+    gap_meta = {
+        "short_gap_count": int(len(short_gap_rows)),
+        "long_gap_count": int(len(long_gap_rows)),
+        "short_gap_rows": short_gap_rows,
+        "long_gap_rows": long_gap_rows,
+    }
+
+    return df, gap_meta
 
 
 def run_depth_qc(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     """
     depth_m 이상치 제거 모듈
 
-    향후 구현 예정
-    - Hampel filter
-    - rolling MAD 기반 스파이크 제거
-    - 제거 개수 / 비율 기록
+    현재 구현
+    - Hampel(rolling median + MAD) 기반 이상치 플래그
+    - |d(depth)/dt| 물리 룰 기반 이상치 플래그
+    - 보간/수정 없이 flag + exclude 후보 컬럼 생성
     """
-    raise NotImplementedError("run_depth_qc()는 다음 단계에서 구현 예정입니다.")
+    if cfg.depth_col not in df.columns:
+        raise KeyError(f"run_depth_qc() 실행을 위해 '{cfg.depth_col}' 컬럼이 필요합니다.")
+
+    def qc_despike_depth(
+        depth: pd.Series,
+        dt: float,
+        method: str = "hampel",
+        window_sec: float = 3.0,
+        n_sigma: float = 6.0,
+        max_slope_mps: float = 2.0,
+    ) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        """
+        depth 시계열의 이상치 후보를 탐지한다.
+
+        반환
+        - spike_mask_hampel
+        - spike_mask_slope
+        - rolling_median
+        """
+        if method != "hampel":
+            raise ValueError("현재 depth QC는 method='hampel'만 지원합니다.")
+
+        if dt <= 0:
+            raise ValueError("dt는 0보다 커야 합니다.")
+
+        # -------------------------------------------------
+        # 1) Hampel 파라미터 계산
+        # -------------------------------------------------
+        window_n = max(3, int(round(window_sec / dt)))
+        if window_n % 2 == 0:
+            window_n += 1
+
+        # -------------------------------------------------
+        # 2) rolling median + MAD 기반 플래그
+        # -------------------------------------------------
+        rolling_median = depth.rolling(window=window_n, center=True, min_periods=1).median()
+        abs_dev = (depth - rolling_median).abs()
+        rolling_mad = abs_dev.rolling(window=window_n, center=True, min_periods=1).median()
+
+        hampel_threshold = 1.4826 * rolling_mad * n_sigma
+        spike_mask_hampel = (abs_dev > hampel_threshold).fillna(False)
+
+        # -------------------------------------------------
+        # 3) 물리 룰 기반 slope 플래그
+        # -------------------------------------------------
+        slope = (depth.diff().abs() / dt)
+        spike_mask_slope = (slope > max_slope_mps).fillna(False)
+
+        return spike_mask_hampel, spike_mask_slope, rolling_median
+
+    df = df.copy()
+    depth = pd.to_numeric(df[cfg.depth_col], errors="coerce")
+
+    # -----------------------------------------------------
+    # 1) dt 추정 (analysis_time 기반)
+    # -----------------------------------------------------
+    dt = float(cfg.expected_dt_sec)
+    if "analysis_time" in df.columns and len(df) >= 2:
+        dt_series = df["analysis_time"].sort_values().diff().dt.total_seconds().dropna()
+        dt_series = dt_series[dt_series > 0]
+        if not dt_series.empty:
+            dt = float(dt_series.median())
+
+    # -----------------------------------------------------
+    # 2) 이상치 플래그 계산
+    # -----------------------------------------------------
+    spike_mask_hampel, spike_mask_slope, rolling_median = qc_despike_depth(
+        depth=depth,
+        dt=dt,
+        method=cfg.depth_qc_method,
+        window_sec=cfg.depth_qc_window_sec,
+        n_sigma=cfg.depth_qc_n_sigma,
+        max_slope_mps=cfg.depth_qc_max_slope_mps,
+    )
+    anomaly_mask = (spike_mask_hampel | spike_mask_slope)
+
+    # -----------------------------------------------------
+    # 3) isolated spike vs bad segment 구분 (plateau 과탐 완화)
+    # -----------------------------------------------------
+    bad_segment_min_duration_sec = 0.5
+    bad_segment_max_duration_sec = 0.8
+
+    run_id = (anomaly_mask != anomaly_mask.shift(1, fill_value=False)).cumsum()
+    anomaly_groups = df.loc[anomaly_mask].groupby(run_id[anomaly_mask])
+
+    depth_flag_spike = pd.Series(False, index=df.index)
+    depth_flag_bad_segment = pd.Series(False, index=df.index)
+    depth_flag_jump_recover = pd.Series(False, index=df.index)
+    bad_segment_rows = []
+
+    n_isolated_spikes = 0
+    n_jump_recover_spikes = 0
+    n_plateau_candidates = 0
+    n_plateau_suppressed = 0
+
+    plateau_tol = max(0.005, dt * cfg.depth_qc_max_slope_mps * 0.1)
+    jump_mag_threshold = max(0.03, plateau_tol * 6)
+    recovery_tol = max(0.01, plateau_tol * 3)
+
+    for _, g in anomaly_groups:
+        g_idx = g.index
+        start_idx = int(g_idx.min())
+        end_idx = int(g_idx.max())
+
+        if "analysis_time" in df.columns:
+            start_time = df.loc[start_idx, "analysis_time"]
+            end_time = df.loc[end_idx, "analysis_time"]
+            duration_sec = float((end_time - start_time).total_seconds())
+        else:
+            duration_sec = float(max(0.0, (len(g_idx) - 1) * dt))
+
+        seg_depth = depth.loc[g_idx]
+        seg_range = float((seg_depth.max() - seg_depth.min())) if seg_depth.notna().any() else 0.0
+        is_plateau_like = seg_range <= plateau_tol
+        if is_plateau_like:
+            n_plateau_candidates += 1
+
+        has_slope_flag = bool(spike_mask_slope.loc[g_idx].any())
+
+        pre_v = depth.iloc[start_idx - 1] if start_idx > 0 else pd.NA
+        post_v = depth.iloc[end_idx + 1] if end_idx < len(df) - 1 else pd.NA
+        has_prepost = pd.notna(pre_v) and pd.notna(post_v)
+
+        local_recovery = False
+        if has_prepost:
+            local_recovery = abs(float(pre_v - post_v)) <= recovery_tol
+
+        jump_mag = 0.0
+        if has_prepost and seg_depth.notna().any():
+            jump_mag = float(max((seg_depth - float(pre_v)).abs().max(), (seg_depth - float(post_v)).abs().max()))
+        elif seg_depth.notna().any():
+            jump_mag = float((seg_depth.max() - seg_depth.min()))
+
+        seg_diff = seg_depth.diff().dropna()
+        is_discontinuous_glitch = False
+        if not seg_diff.empty:
+            big_jumps = (seg_diff.abs() >= jump_mag_threshold * 0.5)
+            sign_flip = (seg_diff * seg_diff.shift(-1) < 0).fillna(False)
+            is_discontinuous_glitch = bool(big_jumps.sum() >= 2 and sign_flip.any())
+
+        # bad segment 승격: plateau가 아니고, 짧은 시간 내 jump/recover 또는 glitch 패턴일 때만 허용
+        promote_bad_segment = (
+            (not is_plateau_like)
+            and has_slope_flag
+            and (bad_segment_min_duration_sec <= duration_sec <= bad_segment_max_duration_sec)
+            and (jump_mag >= jump_mag_threshold)
+            and (local_recovery or is_discontinuous_glitch)
+        )
+
+        if promote_bad_segment:
+            depth_flag_bad_segment.loc[g_idx] = True
+            rec = {
+                "start_index": start_idx,
+                "end_index": end_idx,
+                "n_rows": int(len(g_idx)),
+                "duration_sec": duration_sec,
+                "jump_mag": jump_mag,
+                "local_recovery": bool(local_recovery),
+                "is_discontinuous_glitch": bool(is_discontinuous_glitch),
+            }
+            if "analysis_time" in df.columns:
+                rec["start_time"] = str(df.loc[start_idx, "analysis_time"])
+                rec["end_time"] = str(df.loc[end_idx, "analysis_time"])
+            bad_segment_rows.append(rec)
+            continue
+
+        # plateau/긴 계단 구간은 bad segment로 승격하지 않고, edge 1~2점만 spike 허용
+        if is_plateau_like:
+            n_plateau_suppressed += 1
+            edge_candidates = []
+            if bool(spike_mask_slope.loc[start_idx]):
+                edge_candidates.append(start_idx)
+            if bool(spike_mask_slope.loc[end_idx]) and end_idx != start_idx:
+                edge_candidates.append(end_idx)
+            if not edge_candidates and has_slope_flag:
+                edge_candidates = [start_idx] if start_idx == end_idx else [start_idx, end_idx]
+
+            for idx in edge_candidates[:2]:
+                depth_flag_spike.loc[idx] = True
+            if len(edge_candidates) == 1:
+                n_isolated_spikes += 1
+            continue
+
+        # 그 외는 spike 후보 우선: 단일점/짧은 jump-recover 패턴
+        if len(g_idx) == 1:
+            depth_flag_spike.loc[g_idx] = True
+            n_isolated_spikes += 1
+        elif local_recovery and jump_mag >= jump_mag_threshold:
+            for idx in list(g_idx)[:2]:
+                depth_flag_spike.loc[idx] = True
+                depth_flag_jump_recover.loc[idx] = True
+                n_jump_recover_spikes += 1
+        else:
+            local_abs_dev = (depth.loc[g_idx] - rolling_median.loc[g_idx]).abs()
+            rep_idx = int(local_abs_dev.fillna(-1).idxmax())
+            depth_flag_spike.loc[rep_idx] = True
+
+    # run_depth_qc는 탐지/판정만 수행하고, 실제 제외 마스크는 정책 함수에서 적용
+    suggested_analysis_mask = (~depth_flag_bad_segment).astype(bool)
+
+    df["depth_flag_spike"] = depth_flag_spike.astype(bool)
+    df["depth_flag_bad_segment"] = depth_flag_bad_segment.astype(bool)
+    df["depth_flag_jump_recover"] = depth_flag_jump_recover.astype(bool)
+    df["depth_flag_hampel"] = spike_mask_hampel.astype(bool)
+    df["depth_flag_slope"] = spike_mask_slope.astype(bool)
+
+    # -----------------------------------------------------
+    # 4) 메타정보 정리
+    # -----------------------------------------------------
+    slope_all = depth.diff().abs() / dt
+    max_abs_slope = float(slope_all.max()) if slope_all.notna().any() else 0.0
+
+    n_flagged_hampel = int(spike_mask_hampel.sum())
+    n_flagged_slope = int(spike_mask_slope.sum())
+    n_flagged_union = int(anomaly_mask.sum())
+
+    n_hampel_only = int((spike_mask_hampel & ~spike_mask_slope).sum())
+    n_slope_only = int((spike_mask_slope & ~spike_mask_hampel).sum())
+    n_overlap_hampel_slope = int((spike_mask_hampel & spike_mask_slope).sum())
+    spike_rate = float(n_flagged_union / len(df)) if len(df) > 0 else 0.0
+
+    n_analysis_mask_false = int((~suggested_analysis_mask).sum())
+    analysis_mask_false_rate = float(n_analysis_mask_false / len(df)) if len(df) > 0 else 0.0
+
+    n_bad_segments_short = int(sum(1 for r in bad_segment_rows if r.get("duration_sec", 0.0) <= 0.3))
+    n_bad_segments_long = int(sum(1 for r in bad_segment_rows if r.get("duration_sec", 0.0) > 0.3))
+
+    depth_std_before = float(depth.std(skipna=True)) if depth.notna().any() else None
+    kept_depth = depth[suggested_analysis_mask]
+    depth_std_after = float(kept_depth.std(skipna=True)) if kept_depth.notna().any() else None
+    if depth_std_before is None or depth_std_before == 0 or depth_std_after is None:
+        depth_std_ratio = None
+    else:
+        depth_std_ratio = float(depth_std_after / depth_std_before)
+
+    prev_depth = depth.shift(1)
+    next_depth = depth.shift(-1)
+    local_extrema_mask = ((depth > prev_depth) & (depth > next_depth)) | ((depth < prev_depth) & (depth < next_depth))
+    local_extrema_near_mask = local_extrema_mask | local_extrema_mask.shift(1, fill_value=False) | local_extrema_mask.shift(-1, fill_value=False)
+    if n_flagged_union > 0:
+        extrema_flag_ratio = float((anomaly_mask & local_extrema_near_mask).sum() / n_flagged_union)
+    else:
+        extrema_flag_ratio = None
+
+    qc_meta = {
+        "n_flagged_spikes": n_flagged_union,
+        "n_flagged_spikes_hampel": n_flagged_hampel,
+        "n_flagged_spikes_slope": n_flagged_slope,
+        "n_flagged_spikes_union": n_flagged_union,
+        "n_hampel_only": n_hampel_only,
+        "n_slope_only": n_slope_only,
+        "n_overlap_hampel_slope": n_overlap_hampel_slope,
+        "spike_rate": spike_rate,
+        "n_analysis_mask_time_domain_false": n_analysis_mask_false,
+        "analysis_mask_time_domain_false_rate": analysis_mask_false_rate,
+        "n_bad_segments": int(len(bad_segment_rows)),
+        "n_bad_segments_short": n_bad_segments_short,
+        "n_bad_segments_long": n_bad_segments_long,
+        "bad_segment_min_duration_sec": bad_segment_min_duration_sec,
+        "n_isolated_spikes": int(n_isolated_spikes),
+        "n_jump_recover_spikes": int(n_jump_recover_spikes),
+        "n_plateau_candidates": int(n_plateau_candidates),
+        "n_plateau_suppressed": int(n_plateau_suppressed),
+        "n_bad_segments_after_plateau_filter": int(len(bad_segment_rows)),
+        "bad_segment_rows": bad_segment_rows,
+        "depth_std_before": depth_std_before,
+        "depth_std_after": depth_std_after,
+        "depth_std_ratio": depth_std_ratio,
+        "extrema_flag_ratio": extrema_flag_ratio,
+        "method": cfg.depth_qc_method,
+        "window_sec": float(cfg.depth_qc_window_sec),
+        "n_sigma": float(cfg.depth_qc_n_sigma),
+        "max_slope_mps": float(cfg.depth_qc_max_slope_mps),
+        "max_abs_slope": max_abs_slope,
+    }
+
+    return df, qc_meta
+
+
+def apply_depth_exclusion_policy(df: pd.DataFrame, cfg: Config, qc_meta: Dict) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Depth 제외 정책 적용 모듈
+
+    목적
+    - run_depth_qc()는 탐지/판정만 수행
+    - 실제 analysis_mask_time_domain 제외는 정책 스위치로 적용
+    """
+    df = df.copy()
+
+    flag_spike = df.get("depth_flag_spike", False).astype(bool)
+    flag_bad_segment = df.get("depth_flag_bad_segment", False).astype(bool)
+    flag_jump_recover = df.get("depth_flag_jump_recover", False).astype(bool)
+
+    exclude_jump = flag_jump_recover if cfg.exclude_jump_recover_candidates else pd.Series(False, index=df.index)
+    exclude_bad = flag_bad_segment if cfg.exclude_bad_segments else pd.Series(False, index=df.index)
+    exclude_isolated = (
+        flag_spike & (~flag_jump_recover) & (~flag_bad_segment)
+        if cfg.exclude_isolated_spikes
+        else pd.Series(False, index=df.index)
+    )
+
+    excluded_union = exclude_jump | exclude_bad | exclude_isolated
+    analysis_mask_time_domain = (~excluded_union).astype(bool)
+    df["analysis_mask_time_domain"] = analysis_mask_time_domain
+
+    n_rows = len(df)
+    n_excluded = int(excluded_union.sum())
+    exclusion_meta = {
+        "exclude_jump_recover_candidates": bool(cfg.exclude_jump_recover_candidates),
+        "exclude_bad_segments": bool(cfg.exclude_bad_segments),
+        "exclude_isolated_spikes": bool(cfg.exclude_isolated_spikes),
+        "n_excluded_total": n_excluded,
+        "excluded_rate_total": float(n_excluded / n_rows) if n_rows > 0 else 0.0,
+        "n_excluded_jump_recover": int(exclude_jump.sum()),
+        "n_excluded_bad_segments": int(exclude_bad.sum()),
+        "n_excluded_isolated_spikes": int(exclude_isolated.sum()),
+        "n_analysis_mask_time_domain_false": int((~analysis_mask_time_domain).sum()),
+        "analysis_mask_time_domain_false_rate": float((~analysis_mask_time_domain).sum() / n_rows) if n_rows > 0 else 0.0,
+    }
+
+    return df, exclusion_meta
 
 
 def run_detrend(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
     """
     기준수면 제거 모듈
 
-    향후 구현 예정
-    - rolling mean
-    - low-frequency trend 제거
-    - eta(수면변위) 생성
+    구현 내용
+    - eta_centered: 평균 제거
+    - eta_tide: 저주파(조석 성분)
+    - eta_detrended: centered - tide
+    - eta_short: 단주기 대역(기본 2~25s)
+    - eta_ig: IG 대역(기본 25~300s)
+
+    필터 우선순위
+    1) scipy.signal (butter + filtfilt/sosfilt)
+    2) 실패 시 rolling 기반 fallback
     """
-    raise NotImplementedError("run_detrend()는 다음 단계에서 구현 예정입니다.")
+    df = df.copy()
+
+    if cfg.depth_col not in df.columns:
+        raise KeyError(f"필수 컬럼이 없습니다: {cfg.depth_col}")
+
+    depth = pd.to_numeric(df[cfg.depth_col], errors="coerce")
+    if not depth.notna().any():
+        raise ValueError("depth 시계열이 모두 결측입니다.")
+
+    dt_sec = float(cfg.expected_dt_sec)
+    if "analysis_time" in df.columns and len(df) >= 2:
+        dt = df["analysis_time"].diff().dt.total_seconds()
+        dt = dt[(dt > 0) & dt.notna()]
+        if not dt.empty:
+            dt_sec = float(dt.median())
+
+    fs = 1.0 / dt_sec if dt_sec > 0 else 1.0
+    nyq = 0.5 * fs
+
+    eta_centered = depth - depth.mean(skipna=True)
+
+    tide_cutoff_sec = float(cfg.detrend_tide_cutoff_sec)
+    short_band_sec = (float(cfg.detrend_short_band_sec[0]), float(cfg.detrend_short_band_sec[1]))
+    ig_band_sec = (float(cfg.detrend_ig_band_sec[0]), float(cfg.detrend_ig_band_sec[1]))
+
+    filter_method = "rolling_fallback"
+
+    def _rolling_lowpass(s: pd.Series, cutoff_sec: float) -> pd.Series:
+        win = max(3, int(round(cutoff_sec / dt_sec)))
+        if win % 2 == 0:
+            win += 1
+        return s.rolling(window=win, center=bool(cfg.detrend_zero_phase), min_periods=1).mean()
+
+    def _rolling_bandpass(s: pd.Series, band_sec: Tuple[float, float]) -> pd.Series:
+        p_min, p_max = sorted(band_sec)
+        # 고역통과(느린 성분 제거)
+        slow = _rolling_lowpass(s, p_max)
+        hp = s - slow
+        # 저역통과(너무 빠른 성분 완화)
+        return _rolling_lowpass(hp, p_min)
+
+    eta_tide = _rolling_lowpass(eta_centered, tide_cutoff_sec)
+    eta_detrended = eta_centered - eta_tide
+    eta_short = _rolling_bandpass(eta_detrended, short_band_sec)
+    eta_ig = _rolling_bandpass(eta_detrended, ig_band_sec)
+
+    try:
+        from scipy import signal
+
+        def _to_numpy_filled(s: pd.Series) -> np.ndarray:
+            return s.interpolate(limit_direction="both").fillna(0.0).to_numpy(dtype=float)
+
+        def _apply_sos(sos, x: np.ndarray) -> np.ndarray:
+            if cfg.detrend_zero_phase:
+                return signal.sosfiltfilt(sos, x)
+            return signal.sosfilt(sos, x)
+
+        x = _to_numpy_filled(eta_centered)
+
+        # 저역통과(조석)
+        tide_fc = 1.0 / tide_cutoff_sec
+        tide_fc = min(max(tide_fc, 1e-9), nyq * 0.95)
+        sos_tide = signal.butter(4, tide_fc, btype="lowpass", fs=fs, output="sos")
+        eta_tide_np = _apply_sos(sos_tide, x)
+        eta_detrended_np = x - eta_tide_np
+
+        def _band_period_to_freq(period_band_sec: Tuple[float, float]) -> Tuple[float, float]:
+            p1, p2 = sorted(period_band_sec)
+            # period가 길수록 저주파
+            low_f = 1.0 / p2
+            high_f = 1.0 / p1
+            low_f = min(max(low_f, 1e-9), nyq * 0.95)
+            high_f = min(max(high_f, low_f * 1.05), nyq * 0.98)
+            return low_f, high_f
+
+        short_f = _band_period_to_freq(short_band_sec)
+        ig_f = _band_period_to_freq(ig_band_sec)
+
+        sos_short = signal.butter(4, short_f, btype="bandpass", fs=fs, output="sos")
+        sos_ig = signal.butter(4, ig_f, btype="bandpass", fs=fs, output="sos")
+
+        eta_short_np = _apply_sos(sos_short, eta_detrended_np)
+        eta_ig_np = _apply_sos(sos_ig, eta_detrended_np)
+
+        eta_tide = pd.Series(eta_tide_np, index=df.index)
+        eta_detrended = pd.Series(eta_detrended_np, index=df.index)
+        eta_short = pd.Series(eta_short_np, index=df.index)
+        eta_ig = pd.Series(eta_ig_np, index=df.index)
+        filter_method = "scipy.signal.butter+sosfiltfilt" if cfg.detrend_zero_phase else "scipy.signal.butter+sosfilt"
+
+    except Exception:
+        # scipy 미설치/필터 실패 시 rolling fallback 유지
+        pass
+
+    df["eta_centered"] = eta_centered
+    df["eta_tide"] = eta_tide
+    df["eta_detrended"] = eta_detrended
+    df["eta_short"] = eta_short
+    df["eta_ig"] = eta_ig
+
+    detrend_meta = {
+        "dt_sec": float(dt_sec),
+        "tide_cutoff_sec": tide_cutoff_sec,
+        "short_band_sec": [short_band_sec[0], short_band_sec[1]],
+        "ig_band_sec": [ig_band_sec[0], ig_band_sec[1]],
+        "zero_phase": bool(cfg.detrend_zero_phase),
+        "filter_method": filter_method,
+    }
+
+    return df, detrend_meta
 
 
 # =========================================================
@@ -575,6 +1142,394 @@ def save_meta(results: AnalysisResults, out_dir: Path):
         json.dump(results.meta, f, ensure_ascii=False, indent=2, default=str)
 
 
+def save_excluded_rows_txt(excluded_df: pd.DataFrame, out_dir: Path, filename: str) -> Path:
+    """
+    처리 제외된 raw 행을 텍스트(.txt)로 저장한다.
+    """
+    output_path = out_dir / filename
+
+    if excluded_df.empty:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("[INFO] 처리 제외된 행이 없습니다.\n")
+        return output_path
+
+    export_df = excluded_df.copy()
+    if "analysis_time" in export_df.columns:
+        export_df["analysis_time"] = export_df["analysis_time"].astype(str)
+
+    preferred_cols = [
+        "raw_row_index",
+        "analysis_time",
+        "exclusion_reason",
+        "exclusion_reason_count",
+        "excluded_by_invalid_time",
+        "excluded_by_duplicate_time",
+        "excluded_by_invalid_depth",
+        "time_local",
+        "depth_m",
+    ]
+    existing_preferred = [c for c in preferred_cols if c in export_df.columns]
+    remaining_cols = [c for c in export_df.columns if c not in existing_preferred]
+    export_df = export_df[existing_preferred + remaining_cols]
+
+    sort_cols = [c for c in ["analysis_time", "time_local"] if c in export_df.columns]
+    if sort_cols:
+        export_df = export_df.sort_values(by=sort_cols)
+    export_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+    return output_path
+
+
+def plot_depth_qc_review(df: pd.DataFrame, out_dir: Path, cfg: Config, qc_meta: Dict) -> Dict:
+    """
+    Depth QC 검증용 시각화/진단 모듈
+
+    현재 구현
+    - 탐지 후보가 있을 때만 review plot 생성
+    - 우선순위: jump_recover > slope > isolated_spikes > hampel > union
+    - 같은 종류 내 대표성(밀집도/크기/지속시간) 기반으로 우선 선택
+    """
+    review_meta = {
+        "selected_segments": [],
+        "saved_plots": [],
+        "extrema_flag_ratio": qc_meta.get("extrema_flag_ratio"),
+        "selected_plots_total": 0,
+        "selected_jump_recover": 0,
+        "selected_slope": 0,
+        "selected_isolated_spikes": 0,
+        "selected_hampel": 0,
+        "selected_union": 0,
+    }
+
+    if not cfg.save_plot:
+        return review_meta
+
+    if cfg.depth_col not in df.columns:
+        return review_meta
+
+    # -----------------------------------------------------
+    # 1) 마스크 준비
+    # -----------------------------------------------------
+    hampel_mask = df.get("depth_flag_hampel", False).astype(bool)
+    slope_mask = df.get("depth_flag_slope", False).astype(bool)
+    jump_recover_mask = df.get("depth_flag_jump_recover", False).astype(bool)
+    spike_mask = df.get("depth_flag_spike", False).astype(bool)
+
+    union_mask = hampel_mask | slope_mask
+    isolated_spike_mask = spike_mask & (~jump_recover_mask) & (~df.get("depth_flag_bad_segment", False).astype(bool))
+
+    # 후보가 없으면 생성하지 않음
+    if not (union_mask.any() or jump_recover_mask.any() or isolated_spike_mask.any()):
+        return review_meta
+
+    dt = float(cfg.expected_dt_sec)
+    if "analysis_time" in df.columns and len(df) >= 2:
+        dt_series = df["analysis_time"].sort_values().diff().dt.total_seconds().dropna()
+        dt_series = dt_series[dt_series > 0]
+        if not dt_series.empty:
+            dt = float(dt_series.median())
+
+    window_n = max(5, int(round(10.0 / dt)))
+
+    def build_candidates(mask: pd.Series, criterion: str, max_candidates: int = 40):
+        if not mask.any():
+            return []
+
+        density = mask.astype(int).rolling(window=window_n, center=True, min_periods=1).sum()
+        centers = density.sort_values(ascending=False).index.tolist()
+
+        candidates = []
+        used = []
+        for c in centers:
+            if len(candidates) >= max_candidates:
+                break
+            c = int(c)
+            if any(abs(c - u) < window_n for u in used):
+                continue
+
+            s_idx = max(0, c - window_n // 2)
+            e_idx = min(len(df) - 1, c + window_n // 2)
+
+            part_mask = mask.iloc[s_idx:e_idx + 1]
+            if not part_mask.any():
+                continue
+
+            # 대표성 점수: 밀집도 + depth 변화 크기 + 시간 지속 길이
+            density_score = int(part_mask.sum())
+            y = pd.to_numeric(df.iloc[s_idx:e_idx + 1][cfg.depth_col], errors="coerce")
+            mag_score = float((y.max() - y.min())) if y.notna().any() else 0.0
+
+            if "analysis_time" in df.columns:
+                t0 = df.iloc[s_idx]["analysis_time"]
+                t1 = df.iloc[e_idx]["analysis_time"]
+                duration_score = float((t1 - t0).total_seconds())
+            else:
+                duration_score = float((e_idx - s_idx) * dt)
+
+            score = density_score * 10.0 + mag_score + duration_score
+            candidates.append(
+                {
+                    "start_index": int(s_idx),
+                    "end_index": int(e_idx),
+                    "label": criterion,
+                    "score": float(score),
+                }
+            )
+            used.append(c)
+
+        return candidates
+
+    # -----------------------------------------------------
+    # 2) 우선순위 기반 후보 구성
+    # -----------------------------------------------------
+    cand_jump = build_candidates(jump_recover_mask, "jump_recover")
+    cand_slope = build_candidates(slope_mask, "slope")
+    cand_isolated = build_candidates(isolated_spike_mask, "isolated_spikes")
+    cand_hampel = build_candidates(hampel_mask, "hampel")
+    cand_union = build_candidates(union_mask, "union")
+
+    priority_buckets = [
+        ("jump_recover", cand_jump),
+        ("slope", cand_slope),
+        ("isolated_spikes", cand_isolated),
+        ("hampel", cand_hampel),
+        ("union", cand_union),
+    ]
+
+    selected = []
+    occupied = []
+    max_plots = 10
+
+    for criterion, bucket in priority_buckets:
+        if len(selected) >= max_plots:
+            break
+
+        bucket = sorted(bucket, key=lambda x: x["score"], reverse=True)
+        for seg in bucket:
+            if len(selected) >= max_plots:
+                break
+
+            s_idx = int(seg["start_index"])
+            e_idx = int(seg["end_index"])
+            if any(not (e_idx < os or s_idx > oe) for os, oe in occupied):
+                continue
+
+            selected.append(seg)
+            occupied.append((s_idx, e_idx))
+
+    review_meta["selected_segments"] = selected
+
+    # -----------------------------------------------------
+    # 3) 구간별 그래프 저장
+    # -----------------------------------------------------
+    bad_mask = (~df.get("analysis_mask_time_domain", True)).astype(bool)
+
+    for i, seg in enumerate(selected, start=1):
+        s_idx = int(seg["start_index"])
+        e_idx = int(seg["end_index"])
+        criterion = seg["label"]
+
+        part = df.iloc[s_idx:e_idx + 1].copy()
+        if part.empty:
+            continue
+
+        x = part["analysis_time"] if "analysis_time" in part.columns else part.index
+        y = pd.to_numeric(part[cfg.depth_col], errors="coerce")
+
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.plot(x, y, color="black", linewidth=1.0, label="raw depth_m")
+
+        local_hampel = hampel_mask.iloc[s_idx:e_idx + 1].values
+        local_slope = slope_mask.iloc[s_idx:e_idx + 1].values
+        local_jump_recover = jump_recover_mask.iloc[s_idx:e_idx + 1].values
+
+        local_hampel_only = local_hampel & (~local_slope)
+        local_slope_only = local_slope & (~local_hampel)
+        local_overlap = local_hampel & local_slope
+
+        part_hampel_only = part[local_hampel_only]
+        if not part_hampel_only.empty:
+            xh = part_hampel_only["analysis_time"] if "analysis_time" in part_hampel_only.columns else part_hampel_only.index
+            yh = pd.to_numeric(part_hampel_only[cfg.depth_col], errors="coerce")
+            ax.scatter(xh, yh, color="red", marker="o", s=22, label="hampel-only", zorder=5)
+
+        part_slope_only = part[local_slope_only]
+        if not part_slope_only.empty:
+            xs = part_slope_only["analysis_time"] if "analysis_time" in part_slope_only.columns else part_slope_only.index
+            ys = pd.to_numeric(part_slope_only[cfg.depth_col], errors="coerce")
+            ax.scatter(xs, ys, color="blue", marker="x", s=28, label="slope-only", zorder=5)
+
+        part_overlap = part[local_overlap]
+        if not part_overlap.empty:
+            xo = part_overlap["analysis_time"] if "analysis_time" in part_overlap.columns else part_overlap.index
+            yo = pd.to_numeric(part_overlap[cfg.depth_col], errors="coerce")
+            ax.scatter(xo, yo, color="purple", marker="D", s=24, label="hampel+slope overlap", zorder=6)
+
+        part_jump = part[local_jump_recover]
+        if not part_jump.empty:
+            xj = part_jump["analysis_time"] if "analysis_time" in part_jump.columns else part_jump.index
+            yj = pd.to_numeric(part_jump[cfg.depth_col], errors="coerce")
+            ax.scatter(xj, yj, color="gold", edgecolor="black", marker="*", s=80, label="jump_recover_spike", zorder=7)
+
+        local_bad = bad_mask.iloc[s_idx:e_idx + 1].reset_index(drop=True)
+        if local_bad.any():
+            rid = (local_bad != local_bad.shift(1, fill_value=False)).cumsum()
+            for _, grp in local_bad[local_bad].groupby(rid[local_bad]):
+                gs = grp.index.min()
+                ge = grp.index.max()
+                x0 = x.iloc[gs]
+                x1 = x.iloc[ge]
+                ax.axvspan(x0, x1, color="orange", alpha=0.25, label="analysis_mask_time_domain=False")
+
+        ax.set_title(f"Depth QC Review #{i} [{criterion}]")
+        ax.set_xlabel("time")
+        ax.set_ylabel("depth_m")
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys(), loc="best")
+        ax.grid(alpha=0.3)
+
+        output_path = out_dir / f"depth_qc_review_{i:02d}_{criterion}.png"
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150)
+        plt.close(fig)
+
+        review_meta["saved_plots"].append(str(output_path))
+
+    # -----------------------------------------------------
+    # 4) 선택 결과 메타 집계
+    # -----------------------------------------------------
+    selected_labels = [seg.get("label") for seg in selected]
+    review_meta["selected_plots_total"] = int(len(selected_labels))
+    review_meta["selected_jump_recover"] = int(sum(1 for x in selected_labels if x == "jump_recover"))
+    review_meta["selected_slope"] = int(sum(1 for x in selected_labels if x == "slope"))
+    review_meta["selected_isolated_spikes"] = int(sum(1 for x in selected_labels if x == "isolated_spikes"))
+    review_meta["selected_hampel"] = int(sum(1 for x in selected_labels if x == "hampel"))
+    review_meta["selected_union"] = int(sum(1 for x in selected_labels if x == "union"))
+
+    return review_meta
+
+
+def plot_detrend_review(df: pd.DataFrame, out_dir: Path, cfg: Config) -> Dict:
+    """
+    Detrend 검증용 시각화
+
+    생성 그래프
+    - 전체 구간: depth vs eta_tide
+    - 짧은 구간 확대: depth / eta_short / eta_ig
+    """
+    review_meta = {
+        "saved_plots": [],
+        "selected_short_review_segments": [],
+        "detrend_review_plots_total": 0,
+    }
+
+    if not cfg.save_plot:
+        return review_meta
+
+    required_cols = [cfg.depth_col, "eta_short", "eta_ig", "eta_tide"]
+    if any(col not in df.columns for col in required_cols):
+        return review_meta
+
+    x = df["analysis_time"] if "analysis_time" in df.columns else df.index
+
+    # 1) 전체 구간 depth vs eta_tide (이중 y축)
+    fig, ax_left = plt.subplots(figsize=(12, 4.0))
+    ax_right = ax_left.twinx()
+
+    line_depth, = ax_left.plot(x, df[cfg.depth_col], color="black", linewidth=0.8, label="depth")
+    line_tide, = ax_right.plot(x, df["eta_tide"], color="tab:orange", linewidth=0.9, label="eta_tide")
+
+    ax_left.set_title("Detrend Review (Full): depth vs eta_tide")
+    ax_left.set_xlabel("time")
+    ax_left.set_ylabel("depth", color="black")
+    ax_right.set_ylabel("eta_tide", color="tab:orange")
+    ax_left.tick_params(axis="y", colors="black")
+    ax_right.tick_params(axis="y", colors="tab:orange")
+    ax_left.grid(alpha=0.3)
+
+    lines = [line_depth, line_tide]
+    labels = [ln.get_label() for ln in lines]
+    ax_left.legend(lines, labels, loc="upper center", bbox_to_anchor=(0.5, 1.18), ncol=2, frameon=True)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    full_path = out_dir / "detrend_review_depth_vs_tide_full.png"
+    fig.savefig(full_path, dpi=150)
+    plt.close(fig)
+    review_meta["saved_plots"].append(str(full_path))
+
+    # 2) 짧은 구간 확대(대표성 기반 최대 5개)
+    dt_sec = float(cfg.expected_dt_sec)
+    if "analysis_time" in df.columns and len(df) >= 2:
+        dt = df["analysis_time"].diff().dt.total_seconds()
+        dt = dt[(dt > 0) & dt.notna()]
+        if not dt.empty:
+            dt_sec = float(dt.median())
+    zoom_n = max(100, int(round(180.0 / dt_sec)))
+    zoom_n = min(zoom_n, len(df))
+    max_short_plots = 5
+
+    amp = pd.to_numeric(df["eta_short"], errors="coerce").abs().fillna(0.0) + pd.to_numeric(df["eta_ig"], errors="coerce").abs().fillna(0.0)
+    score = amp.rolling(window=max(5, zoom_n // 2), center=True, min_periods=1).mean()
+    ranked_pos = list(np.argsort(-score.to_numpy(dtype=float)))
+
+    selected_windows = []
+    for center_idx in ranked_pos:
+        s = int(max(0, int(center_idx) - zoom_n // 2))
+        e = int(min(len(df), s + zoom_n))
+        s = int(max(0, e - zoom_n))
+        overlap = any(not (e <= ws or we <= s) for ws, we in selected_windows)
+        if overlap:
+            continue
+        selected_windows.append((s, e))
+        if len(selected_windows) >= max_short_plots:
+            break
+
+    if not selected_windows and len(df) > 0:
+        selected_windows = [(0, zoom_n)]
+
+    for i, (s, e) in enumerate(selected_windows, start=1):
+        seg_x = x.iloc[s:e] if hasattr(x, "iloc") else x[s:e]
+        seg_depth = pd.to_numeric(df[cfg.depth_col].iloc[s:e], errors="coerce")
+        seg_short = pd.to_numeric(df["eta_short"].iloc[s:e], errors="coerce")
+        seg_ig = pd.to_numeric(df["eta_ig"].iloc[s:e], errors="coerce")
+
+        fig, ax = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+        ax[0].plot(seg_x, seg_depth, color="black", linewidth=0.9)
+        ax[0].set_ylabel("depth")
+        ax[0].grid(alpha=0.3)
+
+        ax[1].plot(seg_x, seg_short, color="tab:blue", linewidth=0.9)
+        ax[1].set_ylabel("eta_short")
+        ax[1].grid(alpha=0.3)
+
+        ax[2].plot(seg_x, seg_ig, color="tab:green", linewidth=0.9)
+        ax[2].set_ylabel("eta_ig")
+        ax[2].grid(alpha=0.3)
+        ax[2].set_xlabel("time")
+
+        fig.suptitle(f"Detrend Review (Zoom #{i}): depth / eta_short / eta_ig")
+        fig.tight_layout()
+        zoom_path = out_dir / f"detrend_review_zoom_{i:02d}.png"
+        fig.savefig(zoom_path, dpi=150)
+        plt.close(fig)
+        review_meta["saved_plots"].append(str(zoom_path))
+
+        segment_info = {
+            "rank": int(i),
+            "start_index": int(s),
+            "end_index": int(e - 1),
+        }
+        if "analysis_time" in df.columns:
+            try:
+                segment_info["start_time"] = str(df["analysis_time"].iloc[s])
+                segment_info["end_time"] = str(df["analysis_time"].iloc[e - 1])
+            except Exception:
+                pass
+        review_meta["selected_short_review_segments"].append(segment_info)
+
+    review_meta["detrend_review_plots_total"] = int(len(review_meta["saved_plots"]))
+
+    return review_meta
+
 def plot_time_domain_stats(td_stats_df: pd.DataFrame, out_dir: Path, cfg: Config):
     """
     시간영역 통계 그래프 저장 모듈
@@ -610,7 +1565,7 @@ def plot_swell_stats(swell_df: pd.DataFrame, out_dir: Path, cfg: Config):
 # =========================================================
 # 8. Pipeline Controller
 # =========================================================
-def run_pipeline(file_path: Path, cfg: Config) -> AnalysisResults:
+def run_pipeline(file_path: Path, cfg: Config, out_dir: Path) -> AnalysisResults:
     """
     전체 분석 파이프라인 실행 함수
 
@@ -635,26 +1590,44 @@ def run_pipeline(file_path: Path, cfg: Config) -> AnalysisResults:
     # -----------------------------------------------------
     # 1) 입력 파일 로드
     # -----------------------------------------------------
-    df, load_meta = load_input_file(file_path, cfg)
+    df, load_meta = load_input_file(file_path, cfg, out_dir)
     log_meta(results, "load_input", load_meta)
 
     # -----------------------------------------------------
     # 2) 이후 단계에서 아래 순서를 그대로 유지하며 기능 추가
     # 구조를 바꾸지 않고 각 함수 내부만 채워 넣는 것이 원칙
     # -----------------------------------------------------
-    # if cfg.run_timebase_qa:
-    #     df, meta = run_timebase_qa(df, cfg)
-    #     results.qa = meta
-    #     log_meta(results, "timebase_qa", meta)
-    #
-    # if cfg.run_depth_qc:
-    #     df, meta = run_depth_qc(df, cfg)
-    #     results.qc = meta
-    #     log_meta(results, "depth_qc", meta)
-    #
-    # if cfg.run_detrend:
-    #     df, meta = run_detrend(df, cfg)
-    #     log_meta(results, "detrend", meta)
+    if cfg.run_timebase_qa:
+        df, meta = run_timebase_qa(df, cfg)
+        results.qa = meta
+        log_meta(results, "timebase_qa", meta)
+
+        df, gap_meta = run_gap_handling(df, cfg, meta)
+        log_meta(results, "gap_handling", gap_meta)
+
+    if cfg.run_depth_qc:
+        df, meta = run_depth_qc(df, cfg)
+        results.qc = meta
+        log_meta(results, "depth_qc", meta)
+
+        df, policy_meta = apply_depth_exclusion_policy(df, cfg, meta)
+        log_meta(results, "depth_exclusion_policy", policy_meta)
+
+        review_meta = plot_depth_qc_review(df, out_dir, cfg, meta)
+        log_meta(results, "depth_qc_review", review_meta)
+
+    if cfg.run_detrend:
+        df, meta = run_detrend(df, cfg)
+        log_meta(results, "detrend", meta)
+
+        detrend_review_meta = plot_detrend_review(df, out_dir, cfg)
+        log_meta(results, "detrend_review", detrend_review_meta)
+
+        if cfg.save_decomposed_series_csv:
+            out_cols = ["analysis_time", cfg.depth_col, "eta_centered", "eta_tide", "eta_detrended", "eta_short", "eta_ig"]
+            out_cols = [c for c in out_cols if c in df.columns]
+            save_table(df[out_cols], out_dir, "decomposed_series.csv")
+            results.meta.setdefault("detrend", {})["decomposed_series_csv"] = str(out_dir / "decomposed_series.csv")
     #
     # if cfg.run_wave_detection:
     #     waves_df, meta = detect_individual_waves(df, cfg)
@@ -692,7 +1665,7 @@ def main():
         out_dir = make_output_dir(file_path, cfg)
 
         # 3) 파이프라인 실행
-        results = run_pipeline(file_path, cfg)
+        results = run_pipeline(file_path, cfg, out_dir)
 
         # 4) 메타정보 저장
         save_meta(results, out_dir)
@@ -706,15 +1679,102 @@ def main():
         print(f"- 시간축 기준: {load_meta.get('time_axis_source')}")
         print(f"- 분석 시작 시각: {load_meta.get('analysis_time_start')}")
         print(f"- 분석 종료 시각: {load_meta.get('analysis_time_end')}")
+        print(f"- 원본 행 수: {load_meta.get('raw_n_rows')}")
         print(f"- 처리 행 수: {load_meta.get('processed_n_rows')}")
 
-        if load_meta.get("epoch_check_performed"):
-            print("- epoch_sec 보조 검증 수행됨")
-            print(f"  · mean abs diff (sec): {load_meta.get('epoch_vs_time_local_mean_abs_diff_sec')}")
-            print(f"  · max  abs diff (sec): {load_meta.get('epoch_vs_time_local_max_abs_diff_sec')}")
+        raw_n_rows = load_meta.get("raw_n_rows")
+        processed_n_rows = load_meta.get("processed_n_rows")
+        dropped_invalid_time = load_meta.get("pre_clean_rows_dropped_due_to_invalid_time", 0)
+        dropped_duplicate_time = load_meta.get("pre_clean_rows_dropped_due_to_duplicate_time", 0)
+        dropped_invalid_depth = load_meta.get("pre_clean_rows_dropped_due_to_invalid_depth", 0)
+        excluded_unique = load_meta.get("pre_clean_rows_excluded_total_unique", 0)
+        excluded_multi_reason = load_meta.get("pre_clean_rows_excluded_with_multiple_reasons", 0)
 
-        print("- 현재 단계에서는 파일 로드 및 시간축 표준화까지만 수행했습니다.")
-        print("- 다음 단계에서는 run_timebase_qa()를 구현하는 것이 가장 적절합니다.")
+        if isinstance(raw_n_rows, int) and isinstance(processed_n_rows, int):
+            excluded_n_rows = raw_n_rows - processed_n_rows
+            print(f"- 입력 정리(pre-clean) 제외 행 수(총): {excluded_n_rows}")
+            print(f"- 입력 정리(pre-clean) 제외 행 수(고유): {excluded_unique}")
+            print("  · 제외 근거(대략):")
+            print(f"    - time_local 파싱 실패/결측으로 제외: {dropped_invalid_time}")
+            print(f"    - analysis_time 중복으로 제외: {dropped_duplicate_time}")
+            print(f"    - depth_m 결측 또는 0.0(미계측)으로 제외: {dropped_invalid_depth}")
+            print(f"    - 복수 사유 동시 해당 행 수: {excluded_multi_reason}")
+
+        excluded_txt = load_meta.get("excluded_raw_txt")
+        if excluded_txt:
+            print(f"- 처리 제외 raw 행 파일(.txt): {excluded_txt}")
+
+        qa_meta = results.meta.get("timebase_qa", {})
+        if qa_meta:
+            print("- 시간축 QA 요약(post-clean):")
+            print(f"  · expected dt (sec): {qa_meta.get('post_clean_expected_dt_sec')}")
+            print(f"  · n_rows / n_intervals: {qa_meta.get('post_clean_n_rows')} / {qa_meta.get('post_clean_n_intervals')}")
+            print(f"  · dt mean/median (sec): {qa_meta.get('post_clean_dt_mean_sec')} / {qa_meta.get('post_clean_dt_median_sec')}")
+            print(f"  · dt min/max (sec): {qa_meta.get('post_clean_dt_min_sec')} / {qa_meta.get('post_clean_dt_max_sec')}")
+            print(f"  · |dt-expected| mean/max (sec): {qa_meta.get('post_clean_dt_abs_diff_mean_sec')} / {qa_meta.get('post_clean_dt_abs_diff_max_sec')}")
+            print(f"  · gap intervals: {qa_meta.get('post_clean_n_gap_intervals')}")
+            print(f"  · duplicate intervals(dt=0): {qa_meta.get('post_clean_n_duplicate_intervals')}")
+
+        gap_meta = results.meta.get("gap_handling", {})
+        if gap_meta:
+            print("- Gap Handling 요약:")
+            print(f"  · short gap count (dt<=0.3s): {gap_meta.get('short_gap_count')}")
+            print(f"  · long gap count  (dt>0.3s): {gap_meta.get('long_gap_count')}")
+
+        depth_qc_meta = results.meta.get("depth_qc", {})
+        if depth_qc_meta:
+            def _fmt(v, nd=4):
+                if isinstance(v, (int, float)):
+                    return f"{v:.{nd}f}"
+                return v
+
+            print("- Depth QC 요약:")
+            print(f"  · method: {depth_qc_meta.get('method')}")
+            print(f"  · qc parameters (window_sec / n_sigma / max_slope_mps): {_fmt(depth_qc_meta.get('window_sec'))} sec / {_fmt(depth_qc_meta.get('n_sigma'))} / {_fmt(depth_qc_meta.get('max_slope_mps'))} m/s")
+            print(f"  · n_flagged_spikes(hampel / slope / union): {depth_qc_meta.get('n_flagged_spikes_hampel')} / {depth_qc_meta.get('n_flagged_spikes_slope')} / {depth_qc_meta.get('n_flagged_spikes_union')}")
+            print(f"  · spike_rate: {_fmt(depth_qc_meta.get('spike_rate'))}")
+            print(f"  · n_isolated_spikes / n_jump_recover_spikes: {depth_qc_meta.get('n_isolated_spikes')} / {depth_qc_meta.get('n_jump_recover_spikes')}")
+            print(f"  · n_plateau_candidates / n_plateau_suppressed: {depth_qc_meta.get('n_plateau_candidates')} / {depth_qc_meta.get('n_plateau_suppressed')}")
+            print(f"  · n_bad_segments(short / long): {depth_qc_meta.get('n_bad_segments_short')} / {depth_qc_meta.get('n_bad_segments_long')}")
+            print(f"  · n_bad_segments_after_plateau_filter: {depth_qc_meta.get('n_bad_segments_after_plateau_filter')}")
+            print(f"  · analysis_mask_time_domain=False 개수 / 비율: {depth_qc_meta.get('n_analysis_mask_time_domain_false')} / {_fmt(depth_qc_meta.get('analysis_mask_time_domain_false_rate'))}")
+            print(f"  · bad_segment_min_duration_sec: {_fmt(depth_qc_meta.get('bad_segment_min_duration_sec'))} sec")
+            print(f"  · max_abs_slope (m/s): {_fmt(depth_qc_meta.get('max_abs_slope'))}")
+            print(f"  · std ratio (after / before): {_fmt(depth_qc_meta.get('depth_std_ratio'))}")
+            print(f"  · extrema_flag_ratio: {_fmt(depth_qc_meta.get('extrema_flag_ratio'))}")
+
+        depth_excl_meta = results.meta.get("depth_exclusion_policy", {})
+        if depth_excl_meta:
+            print("- Exclusion Policy 요약:")
+            print(f"  · switches(jump / bad / isolated): {depth_excl_meta.get('exclude_jump_recover_candidates')} / {depth_excl_meta.get('exclude_bad_segments')} / {depth_excl_meta.get('exclude_isolated_spikes')}")
+            print(f"  · n_excluded_total / excluded_rate_total: {depth_excl_meta.get('n_excluded_total')} / {_fmt(depth_excl_meta.get('excluded_rate_total'))}")
+            print(f"  · n_excluded_jump / bad / isolated: {depth_excl_meta.get('n_excluded_jump_recover')} / {depth_excl_meta.get('n_excluded_bad_segments')} / {depth_excl_meta.get('n_excluded_isolated_spikes')}")
+            print(f"  · analysis_mask_time_domain=False 개수 / 비율: {depth_excl_meta.get('n_analysis_mask_time_domain_false')} / {_fmt(depth_excl_meta.get('analysis_mask_time_domain_false_rate'))}")
+
+        depth_qc_review_meta = results.meta.get("depth_qc_review", {})
+        if depth_qc_review_meta:
+            print("- Depth QC Review 요약:")
+            print(f"  · selected segments: {len(depth_qc_review_meta.get('selected_segments', []))}")
+            print(f"  · saved plots: {len(depth_qc_review_meta.get('saved_plots', []))}")
+            print(f"  · selected_plots_total: {depth_qc_review_meta.get('selected_plots_total')}")
+            print(f"  · selected_jump_recover / slope / isolated_spikes / hampel / union: {depth_qc_review_meta.get('selected_jump_recover')} / {depth_qc_review_meta.get('selected_slope')} / {depth_qc_review_meta.get('selected_isolated_spikes')} / {depth_qc_review_meta.get('selected_hampel')} / {depth_qc_review_meta.get('selected_union')}")
+
+        detrend_meta = results.meta.get("detrend", {})
+        if detrend_meta:
+            print("- Detrend 요약:")
+            print(f"  · tide_cutoff_sec: {detrend_meta.get('tide_cutoff_sec')}")
+            print(f"  · short_band: {detrend_meta.get('short_band_sec')}")
+            print(f"  · ig_band: {detrend_meta.get('ig_band_sec')}")
+            print(f"  · zero_phase: {detrend_meta.get('zero_phase')}")
+            print(f"  · filter_method: {detrend_meta.get('filter_method')}")
+
+        detrend_review_meta = results.meta.get("detrend_review", {})
+        if detrend_review_meta:
+            print("- Detrend Review 요약:")
+            print(f"  · selected review plots: {detrend_review_meta.get('detrend_review_plots_total')}")
+            print(f"  · saved plots: {len(detrend_review_meta.get('saved_plots', []))}")
+
+        print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling, depth_qc, detrend까지 수행했습니다.")
 
     except Exception as e:
         print("\n[오류 발생]")
