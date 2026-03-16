@@ -1148,12 +1148,12 @@ def detect_individual_waves(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame
 
             # QC 판정
             reasons = []
-            if not (float(min_period_sec) <= ti <= float(max_period_sec)):
-                reasons.append("period_out_of_range")
-            if crest <= 0:
-                reasons.append("crest_not_positive")
-            if trough >= 0:
-                reasons.append("trough_not_negative")
+            if ti < float(min_period_sec):
+                reasons.append("Ti_too_short")
+            if ti > float(max_period_sec):
+                reasons.append("Ti_too_long")
+            if (crest <= 0) or (trough >= 0):
+                reasons.append("crest_trough_invalid")
 
             valid_wave = len(reasons) == 0
             qc_reason = "ok" if valid_wave else ";".join(reasons)
@@ -1189,13 +1189,31 @@ def detect_individual_waves(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame
             ],
         )
 
+        n_waves_raw = int(len(waves_df))
+        n_waves_valid = int(waves_df["valid_wave"].sum()) if not waves_df.empty else 0
+        n_waves_invalid = int(n_waves_raw - n_waves_valid)
+
+        invalid_reason_counts = {}
+        if not waves_df.empty:
+            invalid_reasons = waves_df.loc[~waves_df["valid_wave"], "qc_reason"]
+            for reason_text in invalid_reasons:
+                for r in str(reason_text).split(";"):
+                    r = r.strip()
+                    if (not r) or (r == "ok"):
+                        continue
+                    invalid_reason_counts[r] = int(invalid_reason_counts.get(r, 0) + 1)
+
         meta = {
             "mode": mode,
             "min_period_sec": float(min_period_sec),
             "max_period_sec": float(max_period_sec),
             "n_crossings": int(len(crossings)),
-            "n_waves_raw": int(len(waves_df)),
-            "n_waves_valid": int(waves_df["valid_wave"].sum()) if not waves_df.empty else 0,
+            "n_waves_raw": n_waves_raw,
+            "n_waves_valid": n_waves_valid,
+            "n_waves_invalid": n_waves_invalid,
+            "valid_wave_rate": float(n_waves_valid / n_waves_raw) if n_waves_raw > 0 else 0.0,
+            "invalid_wave_rate": float(n_waves_invalid / n_waves_raw) if n_waves_raw > 0 else 0.0,
+            "invalid_reason_counts": invalid_reason_counts,
         }
         return waves_df, meta
 
@@ -1684,6 +1702,129 @@ def plot_detrend_review(df: pd.DataFrame, out_dir: Path, cfg: Config) -> Dict:
 
     return review_meta
 
+def plot_wave_detection_review(df: pd.DataFrame, waves_df: pd.DataFrame, out_dir: Path, cfg: Config) -> Dict:
+    """
+    Wave Detection 검증용 시각화
+
+    생성 그래프
+    - eta_short + zero-crossing + crest/trough + wave boundary 오버레이
+    - 대표 구간 최대 5개 저장
+    """
+    review_meta = {
+        "saved_wave_detection_review_plots": [],
+    }
+
+    if not cfg.save_plot:
+        return review_meta
+    if waves_df is None or waves_df.empty:
+        return review_meta
+    if "eta_short" not in df.columns or "analysis_time" not in df.columns:
+        return review_meta
+
+    x = pd.to_datetime(df["analysis_time"], errors="coerce")
+    y = pd.to_numeric(df["eta_short"], errors="coerce")
+    if x.isna().all() or y.notna().sum() < 3:
+        return review_meta
+
+    # 대표성: Hi가 큰 파를 우선 선택, 구간 중복은 최소화
+    candidates = waves_df.sort_values(by="Hi_m", ascending=False).reset_index(drop=True)
+    selected_windows = []
+    max_plots = 5
+
+    for _, w in candidates.iterrows():
+        t_start = pd.to_datetime(w["t_start"], errors="coerce")
+        t_end = pd.to_datetime(w["t_end"], errors="coerce")
+        if pd.isna(t_start) or pd.isna(t_end):
+            continue
+
+        # 경계 확인을 위해 양쪽에 여유 구간 추가
+        t0 = t_start - pd.to_timedelta(5, unit="s")
+        t1 = t_end + pd.to_timedelta(5, unit="s")
+
+        overlap = any(not (t1 <= s0 or s1 <= t0) for s0, s1 in selected_windows)
+        if overlap:
+            continue
+
+        selected_windows.append((t0, t1))
+        if len(selected_windows) >= max_plots:
+            break
+
+    if not selected_windows:
+        return review_meta
+
+    for i, (t0, t1) in enumerate(selected_windows, start=1):
+        seg_mask = (x >= t0) & (x <= t1)
+        if int(seg_mask.sum()) < 3:
+            continue
+
+        seg_x = x[seg_mask]
+        seg_y = y[seg_mask]
+
+        fig, ax = plt.subplots(figsize=(12, 4.2))
+        ax.plot(seg_x, seg_y, color="tab:blue", linewidth=0.9, label="eta_short")
+
+        # 현재 구간에 포함되는 파들
+        seg_waves = waves_df[
+            (pd.to_datetime(waves_df["t_start"], errors="coerce") <= t1)
+            & (pd.to_datetime(waves_df["t_end"], errors="coerce") >= t0)
+        ]
+
+        zero_times = []
+        crest_x, crest_y = [], []
+        trough_x, trough_y = [], []
+
+        for _, w in seg_waves.iterrows():
+            ws = pd.to_datetime(w["t_start"], errors="coerce")
+            we = pd.to_datetime(w["t_end"], errors="coerce")
+            if pd.isna(ws) or pd.isna(we):
+                continue
+
+            # wave boundary (zero-crossing) 표시
+            ax.axvline(ws, color="gray", linestyle="--", linewidth=0.7, alpha=0.8)
+            ax.axvline(we, color="gray", linestyle="--", linewidth=0.7, alpha=0.8)
+            zero_times.extend([ws, we])
+
+            # crest/trough는 wave boundary 내부 eta_short에서 직접 계산
+            in_wave = (x >= ws) & (x <= we)
+            if int(in_wave.sum()) >= 1:
+                wave_y = y[in_wave]
+                wave_x = x[in_wave]
+                try:
+                    cidx = wave_y.idxmax()
+                    tidx = wave_y.idxmin()
+                    crest_x.append(wave_x.loc[cidx])
+                    crest_y.append(float(wave_y.loc[cidx]))
+                    trough_x.append(wave_x.loc[tidx])
+                    trough_y.append(float(wave_y.loc[tidx]))
+                except Exception:
+                    pass
+
+        if zero_times:
+            zt = pd.to_datetime(pd.Series(zero_times)).dropna().drop_duplicates().sort_values()
+            ax.scatter(zt, np.zeros(len(zt)), color="black", s=16, marker="o", label="zero-crossing", zorder=4)
+        if crest_x:
+            ax.scatter(crest_x, crest_y, color="red", s=28, marker="^", label="crest", zorder=5)
+        if trough_x:
+            ax.scatter(trough_x, trough_y, color="green", s=28, marker="v", label="trough", zorder=5)
+
+        ax.set_title(f"Wave Detection Review #{i}: eta_short overlay")
+        ax.set_xlabel("time")
+        ax.set_ylabel("eta_short")
+        ax.grid(alpha=0.3)
+
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys(), loc="best")
+
+        fig.tight_layout()
+        out_path = out_dir / f"wave_detection_review_{i:02d}.png"
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        review_meta["saved_wave_detection_review_plots"].append(str(out_path))
+
+    return review_meta
+
+
 def plot_time_domain_stats(td_stats_df: pd.DataFrame, out_dir: Path, cfg: Config):
     """
     시간영역 통계 그래프 저장 모듈
@@ -1785,6 +1926,10 @@ def run_pipeline(file_path: Path, cfg: Config, out_dir: Path) -> AnalysisResults
     #
     if cfg.run_wave_detection:
         waves_df, meta = detect_individual_waves(df, cfg)
+
+        wave_review_meta = plot_wave_detection_review(df, waves_df, out_dir, cfg)
+        meta["saved_wave_detection_review_plots"] = wave_review_meta.get("saved_wave_detection_review_plots", [])
+
         log_meta(results, "wave_detection", meta)
 
     # if cfg.run_time_domain_stats:
@@ -1934,7 +2079,10 @@ def main():
             print(f"  · mode: {wave_meta.get('mode')}")
             print(f"  · min_period_sec / max_period_sec: {wave_meta.get('min_period_sec')} / {wave_meta.get('max_period_sec')}")
             print(f"  · n_crossings: {wave_meta.get('n_crossings')}")
-            print(f"  · n_waves_raw / n_waves_valid: {wave_meta.get('n_waves_raw')} / {wave_meta.get('n_waves_valid')}")
+            print(f"  · n_waves_raw / valid / invalid: {wave_meta.get('n_waves_raw')} / {wave_meta.get('n_waves_valid')} / {wave_meta.get('n_waves_invalid')}")
+            print(f"  · valid_wave_rate / invalid_wave_rate: {wave_meta.get('valid_wave_rate')} / {wave_meta.get('invalid_wave_rate')}")
+            print(f"  · invalid_reason_counts: {wave_meta.get('invalid_reason_counts')}")
+            print(f"  · saved review plots: {len(wave_meta.get('saved_wave_detection_review_plots', []))}")
 
         print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling, depth_qc, detrend, wave_detection까지 수행했습니다.")
 
