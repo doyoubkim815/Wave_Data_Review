@@ -1414,11 +1414,13 @@ def plot_detrend_review(df: pd.DataFrame, out_dir: Path, cfg: Config) -> Dict:
     Detrend 검증용 시각화
 
     생성 그래프
+    - 전체 구간: depth vs eta_tide
     - 짧은 구간 확대: depth / eta_short / eta_ig
-    - 전체 구간: eta_tide
     """
     review_meta = {
         "saved_plots": [],
+        "selected_short_review_segments": [],
+        "detrend_review_plots_total": 0,
     }
 
     if not cfg.save_plot:
@@ -1430,7 +1432,22 @@ def plot_detrend_review(df: pd.DataFrame, out_dir: Path, cfg: Config) -> Dict:
 
     x = df["analysis_time"] if "analysis_time" in df.columns else df.index
 
-    # 1) 짧은 구간 확대
+    # 1) 전체 구간 depth vs eta_tide
+    fig, ax = plt.subplots(figsize=(12, 4.0))
+    ax.plot(x, df[cfg.depth_col], color="black", linewidth=0.8, label="depth")
+    ax.plot(x, df["eta_tide"], color="tab:orange", linewidth=0.9, label="eta_tide")
+    ax.set_title("Detrend Review (Full): depth vs eta_tide")
+    ax.set_ylabel("depth / eta_tide")
+    ax.set_xlabel("time")
+    ax.grid(alpha=0.3)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    full_path = out_dir / "detrend_review_depth_vs_tide_full.png"
+    fig.savefig(full_path, dpi=150)
+    plt.close(fig)
+    review_meta["saved_plots"].append(str(full_path))
+
+    # 2) 짧은 구간 확대(대표성 기반 최대 5개)
     dt_sec = float(cfg.expected_dt_sec)
     if "analysis_time" in df.columns and len(df) >= 2:
         dt = df["analysis_time"].diff().dt.total_seconds()
@@ -1439,40 +1456,68 @@ def plot_detrend_review(df: pd.DataFrame, out_dir: Path, cfg: Config) -> Dict:
             dt_sec = float(dt.median())
     zoom_n = max(100, int(round(180.0 / dt_sec)))
     zoom_n = min(zoom_n, len(df))
+    max_short_plots = 5
 
-    fig, ax = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
-    ax[0].plot(x.iloc[:zoom_n] if hasattr(x, "iloc") else x[:zoom_n], df[cfg.depth_col].iloc[:zoom_n], color="black", linewidth=0.9)
-    ax[0].set_ylabel("depth")
-    ax[0].grid(alpha=0.3)
+    amp = pd.to_numeric(df["eta_short"], errors="coerce").abs().fillna(0.0) + pd.to_numeric(df["eta_ig"], errors="coerce").abs().fillna(0.0)
+    score = amp.rolling(window=max(5, zoom_n // 2), center=True, min_periods=1).mean()
+    ranked_pos = list(np.argsort(-score.to_numpy(dtype=float)))
 
-    ax[1].plot(x.iloc[:zoom_n] if hasattr(x, "iloc") else x[:zoom_n], df["eta_short"].iloc[:zoom_n], color="tab:blue", linewidth=0.9)
-    ax[1].set_ylabel("eta_short")
-    ax[1].grid(alpha=0.3)
+    selected_windows = []
+    for center_idx in ranked_pos:
+        s = int(max(0, int(center_idx) - zoom_n // 2))
+        e = int(min(len(df), s + zoom_n))
+        s = int(max(0, e - zoom_n))
+        overlap = any(not (e <= ws or we <= s) for ws, we in selected_windows)
+        if overlap:
+            continue
+        selected_windows.append((s, e))
+        if len(selected_windows) >= max_short_plots:
+            break
 
-    ax[2].plot(x.iloc[:zoom_n] if hasattr(x, "iloc") else x[:zoom_n], df["eta_ig"].iloc[:zoom_n], color="tab:green", linewidth=0.9)
-    ax[2].set_ylabel("eta_ig")
-    ax[2].grid(alpha=0.3)
-    ax[2].set_xlabel("time")
+    if not selected_windows and len(df) > 0:
+        selected_windows = [(0, zoom_n)]
 
-    fig.suptitle("Detrend Review (Zoom): depth / eta_short / eta_ig")
-    fig.tight_layout()
-    zoom_path = out_dir / "detrend_review_zoom.png"
-    fig.savefig(zoom_path, dpi=150)
-    plt.close(fig)
-    review_meta["saved_plots"].append(str(zoom_path))
+    for i, (s, e) in enumerate(selected_windows, start=1):
+        seg_x = x.iloc[s:e] if hasattr(x, "iloc") else x[s:e]
+        seg_depth = pd.to_numeric(df[cfg.depth_col].iloc[s:e], errors="coerce")
+        seg_short = pd.to_numeric(df["eta_short"].iloc[s:e], errors="coerce")
+        seg_ig = pd.to_numeric(df["eta_ig"].iloc[s:e], errors="coerce")
 
-    # 2) 전체 eta_tide
-    fig, ax = plt.subplots(figsize=(12, 3.5))
-    ax.plot(x, df["eta_tide"], color="tab:orange", linewidth=0.8)
-    ax.set_title("Detrend Review (Full): eta_tide")
-    ax.set_ylabel("eta_tide")
-    ax.set_xlabel("time")
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    tide_path = out_dir / "detrend_review_eta_tide_full.png"
-    fig.savefig(tide_path, dpi=150)
-    plt.close(fig)
-    review_meta["saved_plots"].append(str(tide_path))
+        fig, ax = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+        ax[0].plot(seg_x, seg_depth, color="black", linewidth=0.9)
+        ax[0].set_ylabel("depth")
+        ax[0].grid(alpha=0.3)
+
+        ax[1].plot(seg_x, seg_short, color="tab:blue", linewidth=0.9)
+        ax[1].set_ylabel("eta_short")
+        ax[1].grid(alpha=0.3)
+
+        ax[2].plot(seg_x, seg_ig, color="tab:green", linewidth=0.9)
+        ax[2].set_ylabel("eta_ig")
+        ax[2].grid(alpha=0.3)
+        ax[2].set_xlabel("time")
+
+        fig.suptitle(f"Detrend Review (Zoom #{i}): depth / eta_short / eta_ig")
+        fig.tight_layout()
+        zoom_path = out_dir / f"detrend_review_zoom_{i:02d}.png"
+        fig.savefig(zoom_path, dpi=150)
+        plt.close(fig)
+        review_meta["saved_plots"].append(str(zoom_path))
+
+        segment_info = {
+            "rank": int(i),
+            "start_index": int(s),
+            "end_index": int(e - 1),
+        }
+        if "analysis_time" in df.columns:
+            try:
+                segment_info["start_time"] = str(df["analysis_time"].iloc[s])
+                segment_info["end_time"] = str(df["analysis_time"].iloc[e - 1])
+            except Exception:
+                pass
+        review_meta["selected_short_review_segments"].append(segment_info)
+
+    review_meta["detrend_review_plots_total"] = int(len(review_meta["saved_plots"]))
 
     return review_meta
 
@@ -1717,6 +1762,7 @@ def main():
         detrend_review_meta = results.meta.get("detrend_review", {})
         if detrend_review_meta:
             print("- Detrend Review 요약:")
+            print(f"  · selected review plots: {detrend_review_meta.get('detrend_review_plots_total')}")
             print(f"  · saved plots: {len(detrend_review_meta.get('saved_plots', []))}")
 
         print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling, depth_qc, detrend까지 수행했습니다.")
