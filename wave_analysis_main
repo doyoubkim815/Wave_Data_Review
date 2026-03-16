@@ -1449,7 +1449,7 @@ def plot_detrend_review(df: pd.DataFrame, out_dir: Path, cfg: Config) -> Dict:
 
     lines = [line_depth, line_tide]
     labels = [ln.get_label() for ln in lines]
-    ax_left.legend(lines, labels, loc="upper center", bbox_to_anchor=(0.5, 1.18), ncol=2, frameon=True)
+    ax_left.legend(lines, labels, loc="upper center", bbox_to_anchor=(0.89, 1.13), ncol=2, frameon=True)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     full_path = out_dir / "detrend_review_depth_vs_tide_full.png"
     fig.savefig(full_path, dpi=150)
