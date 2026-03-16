@@ -1238,13 +1238,73 @@ def compute_time_domain_stats(waves_df: pd.DataFrame, cfg: Config) -> Tuple[pd.D
     """
     시간영역 통계 모듈
 
-    향후 구현 예정
-    - Hs
-    - Hmax
-    - Tz
-    - sliding window 통계
+    구현 내용
+    - valid_wave=True 기준 전체 구간 통계 계산
+    - Nwaves, Hmean, Hs, Hmax, Tz 산출
     """
-    raise NotImplementedError("compute_time_domain_stats()는 다음 단계에서 구현 예정입니다.")
+    # -----------------------------------------------------
+    # 1) 입력 검증 및 유효 파 필터링
+    # -----------------------------------------------------
+    if waves_df is None:
+        waves_df = pd.DataFrame()
+
+    required_cols = ["Hi_m", "Ti_s", "valid_wave"]
+    for col in required_cols:
+        if col not in waves_df.columns:
+            # 파 검출 결과가 비어있는 경우에도 형태를 유지
+            waves_df = waves_df.copy()
+            if col == "valid_wave":
+                waves_df[col] = False
+            else:
+                waves_df[col] = np.nan
+
+    valid_waves = waves_df[waves_df["valid_wave"].astype(bool)].copy()
+
+    # -----------------------------------------------------
+    # 2) 전체 구간 통계 계산
+    # -----------------------------------------------------
+    n_waves = int(len(valid_waves))
+    if n_waves > 0:
+        hi = pd.to_numeric(valid_waves["Hi_m"], errors="coerce").dropna()
+        ti = pd.to_numeric(valid_waves["Ti_s"], errors="coerce").dropna()
+
+        n_waves = int(len(hi))
+        hmean = float(hi.mean()) if n_waves > 0 else np.nan
+        hmax = float(hi.max()) if n_waves > 0 else np.nan
+
+        # Hs: 상위 1/3 평균 파고
+        n_top = max(1, int(np.ceil(n_waves / 3))) if n_waves > 0 else 0
+        hs = float(hi.sort_values(ascending=False).head(n_top).mean()) if n_waves > 0 else np.nan
+
+        # Tz: 평균 영교차 주기
+        tz = float(ti.mean()) if len(ti) > 0 else np.nan
+    else:
+        hmean = np.nan
+        hs = np.nan
+        hmax = np.nan
+        tz = np.nan
+
+    td_stats_df = pd.DataFrame(
+        [
+            {
+                "Nwaves": n_waves,
+                "Hmean": hmean,
+                "Hs": hs,
+                "Hmax": hmax,
+                "Tz": tz,
+            }
+        ]
+    )
+
+    td_meta = {
+        "Nwaves": int(n_waves),
+        "Hmean": float(hmean) if pd.notna(hmean) else None,
+        "Hs": float(hs) if pd.notna(hs) else None,
+        "Hmax": float(hmax) if pd.notna(hmax) else None,
+        "Tz": float(tz) if pd.notna(tz) else None,
+    }
+
+    return td_stats_df, td_meta
 
 
 def compute_spectral_stats(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
@@ -1924,6 +1984,7 @@ def run_pipeline(file_path: Path, cfg: Config, out_dir: Path) -> AnalysisResults
             save_table(df[out_cols], out_dir, "decomposed_series.csv")
             results.meta.setdefault("detrend", {})["decomposed_series_csv"] = str(out_dir / "decomposed_series.csv")
     #
+    waves_df = pd.DataFrame()
     if cfg.run_wave_detection:
         waves_df, meta = detect_individual_waves(df, cfg)
 
@@ -1932,10 +1993,10 @@ def run_pipeline(file_path: Path, cfg: Config, out_dir: Path) -> AnalysisResults
 
         log_meta(results, "wave_detection", meta)
 
-    # if cfg.run_time_domain_stats:
-    #     td_df, meta = compute_time_domain_stats(waves_df, cfg)
-    #     results.td_stats = td_df
-    #     log_meta(results, "time_domain_stats", meta)
+    if cfg.run_time_domain_stats:
+        td_df, meta = compute_time_domain_stats(waves_df, cfg)
+        results.td_stats = td_df
+        log_meta(results, "time_domain_stats", meta)
 
     return results
 
@@ -2084,7 +2145,14 @@ def main():
             print(f"  · invalid_reason_counts: {wave_meta.get('invalid_reason_counts')}")
             print(f"  · saved review plots: {len(wave_meta.get('saved_wave_detection_review_plots', []))}")
 
-        print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling, depth_qc, detrend, wave_detection까지 수행했습니다.")
+        td_meta = results.meta.get("time_domain_stats", {})
+        if td_meta:
+            print("- Time-domain Stats 요약:")
+            print(f"  · Nwaves: {td_meta.get('Nwaves')}")
+            print(f"  · Hmean / Hs / Hmax (m): {td_meta.get('Hmean')} / {td_meta.get('Hs')} / {td_meta.get('Hmax')}")
+            print(f"  · Tz (s): {td_meta.get('Tz')}")
+
+        print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling, depth_qc, detrend, wave_detection, time_domain_stats까지 수행했습니다.")
 
     except Exception as e:
         print("\n[오류 발생]")
