@@ -1055,11 +1055,165 @@ def detect_individual_waves(df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame
     """
     개별 파 검출 모듈
 
-    향후 구현 예정
-    - zero-upcrossing 기반 개별 파 검출
-    - Hi, Ti, crest, trough 생성
+    구현 내용
+    - eta_short 기반 zero-upcrossing 개별 파 검출
+    - analysis_mask_time_domain=False 구간 제외
+    - 파별 crest / trough / Hi / Ti 계산 및 QC
     """
-    raise NotImplementedError("detect_individual_waves()는 다음 단계에서 구현 예정입니다.")
+    # -----------------------------------------------------
+    # 1) 입력 컬럼 검증
+    # -----------------------------------------------------
+    if "eta_short" not in df.columns:
+        raise KeyError("필수 컬럼이 없습니다: eta_short")
+    if "analysis_time" not in df.columns:
+        raise KeyError("필수 컬럼이 없습니다: analysis_time")
+
+    # -----------------------------------------------------
+    # 2) 내부 함수: zero-crossing 기반 파 검출
+    # -----------------------------------------------------
+    def detect_waves_zero_crossing(
+        eta_short: pd.Series,
+        time: pd.Series,
+        mask: Optional[pd.Series] = None,
+        mode: str = "upcross",
+        min_period_sec: float = 2.0,
+        max_period_sec: float = 25.0,
+    ) -> Tuple[pd.DataFrame, Dict]:
+        """
+        zero-crossing 기반 개별 파 검출
+
+        mode
+        - upcross: 음수 -> 양수 교차 기준
+        """
+        if mode != "upcross":
+            raise ValueError(f"현재는 upcross 모드만 지원합니다: {mode}")
+
+        y = pd.to_numeric(eta_short, errors="coerce")
+        t = pd.to_datetime(time, errors="coerce")
+
+        if mask is None:
+            m = pd.Series(True, index=y.index)
+        else:
+            m = pd.Series(mask, index=y.index).fillna(False).astype(bool)
+
+        # 유효값 + 마스크 기반 사용 가능 샘플
+        valid = y.notna() & t.notna() & m
+
+        crossings = []
+
+        # upcrossing: y[i] <= 0, y[i+1] > 0, 두 점 모두 valid
+        for i in range(len(y) - 1):
+            if not (valid.iloc[i] and valid.iloc[i + 1]):
+                continue
+
+            y0 = float(y.iloc[i])
+            y1 = float(y.iloc[i + 1])
+            if (y0 <= 0.0) and (y1 > 0.0):
+                t0 = t.iloc[i]
+                t1 = t.iloc[i + 1]
+                dt = (t1 - t0).total_seconds()
+                if dt <= 0:
+                    continue
+
+                # 선형 보간으로 0-crossing 시각 계산
+                frac = (-y0) / (y1 - y0) if (y1 - y0) != 0 else 0.0
+                frac = float(np.clip(frac, 0.0, 1.0))
+                tc = t0 + pd.to_timedelta(frac * dt, unit="s")
+                crossings.append({"sample_index": int(i), "cross_time": tc})
+
+        waves = []
+        for k in range(len(crossings) - 1):
+            c0 = crossings[k]
+            c1 = crossings[k + 1]
+            i0 = int(c0["sample_index"])
+            i1 = int(c1["sample_index"]) + 1
+
+            if i1 <= i0:
+                continue
+
+            seg_valid = valid.iloc[i0:i1]
+            if not bool(seg_valid.all()):
+                # 마스크/결측이 끼어든 파 구간은 검출 대상에서 제외
+                continue
+
+            seg_y = y.iloc[i0:i1]
+            crest = float(seg_y.max())
+            trough = float(seg_y.min())
+            hi = crest - trough
+
+            t_start = c0["cross_time"]
+            t_end = c1["cross_time"]
+            ti = float((t_end - t_start).total_seconds())
+            t_mid = t_start + (t_end - t_start) / 2
+
+            # QC 판정
+            reasons = []
+            if not (float(min_period_sec) <= ti <= float(max_period_sec)):
+                reasons.append("period_out_of_range")
+            if crest <= 0:
+                reasons.append("crest_not_positive")
+            if trough >= 0:
+                reasons.append("trough_not_negative")
+
+            valid_wave = len(reasons) == 0
+            qc_reason = "ok" if valid_wave else ";".join(reasons)
+
+            waves.append(
+                {
+                    "wave_id": int(len(waves) + 1),
+                    "t_start": t_start,
+                    "t_end": t_end,
+                    "t_mid": t_mid,
+                    "Hi_m": float(hi),
+                    "Ti_s": float(ti),
+                    "crest_m": float(crest),
+                    "trough_m": float(trough),
+                    "valid_wave": bool(valid_wave),
+                    "qc_reason": qc_reason,
+                }
+            )
+
+        waves_df = pd.DataFrame(
+            waves,
+            columns=[
+                "wave_id",
+                "t_start",
+                "t_end",
+                "t_mid",
+                "Hi_m",
+                "Ti_s",
+                "crest_m",
+                "trough_m",
+                "valid_wave",
+                "qc_reason",
+            ],
+        )
+
+        meta = {
+            "mode": mode,
+            "min_period_sec": float(min_period_sec),
+            "max_period_sec": float(max_period_sec),
+            "n_crossings": int(len(crossings)),
+            "n_waves_raw": int(len(waves_df)),
+            "n_waves_valid": int(waves_df["valid_wave"].sum()) if not waves_df.empty else 0,
+        }
+        return waves_df, meta
+
+    # -----------------------------------------------------
+    # 3) 입력 시계열 준비 및 실행
+    # -----------------------------------------------------
+    mask = df.get("analysis_mask_time_domain", pd.Series(True, index=df.index)).fillna(False).astype(bool)
+
+    waves_df, wave_meta = detect_waves_zero_crossing(
+        eta_short=df["eta_short"],
+        time=df["analysis_time"],
+        mask=mask,
+        mode="upcross",
+        min_period_sec=float(cfg.detrend_short_band_sec[0]),
+        max_period_sec=float(cfg.detrend_short_band_sec[1]),
+    )
+
+    return waves_df, wave_meta
 
 
 def compute_time_domain_stats(waves_df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, Dict]:
@@ -1629,10 +1783,10 @@ def run_pipeline(file_path: Path, cfg: Config, out_dir: Path) -> AnalysisResults
             save_table(df[out_cols], out_dir, "decomposed_series.csv")
             results.meta.setdefault("detrend", {})["decomposed_series_csv"] = str(out_dir / "decomposed_series.csv")
     #
-    # if cfg.run_wave_detection:
-    #     waves_df, meta = detect_individual_waves(df, cfg)
-    #     log_meta(results, "wave_detection", meta)
-    #
+    if cfg.run_wave_detection:
+        waves_df, meta = detect_individual_waves(df, cfg)
+        log_meta(results, "wave_detection", meta)
+
     # if cfg.run_time_domain_stats:
     #     td_df, meta = compute_time_domain_stats(waves_df, cfg)
     #     results.td_stats = td_df
@@ -1774,7 +1928,15 @@ def main():
             print(f"  · selected review plots: {detrend_review_meta.get('detrend_review_plots_total')}")
             print(f"  · saved plots: {len(detrend_review_meta.get('saved_plots', []))}")
 
-        print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling, depth_qc, detrend까지 수행했습니다.")
+        wave_meta = results.meta.get("wave_detection", {})
+        if wave_meta:
+            print("- Wave Detection 요약:")
+            print(f"  · mode: {wave_meta.get('mode')}")
+            print(f"  · min_period_sec / max_period_sec: {wave_meta.get('min_period_sec')} / {wave_meta.get('max_period_sec')}")
+            print(f"  · n_crossings: {wave_meta.get('n_crossings')}")
+            print(f"  · n_waves_raw / n_waves_valid: {wave_meta.get('n_waves_raw')} / {wave_meta.get('n_waves_valid')}")
+
+        print("- 현재 단계에서는 파일 로드, 시간축 표준화, timebase_qa, gap_handling, depth_qc, detrend, wave_detection까지 수행했습니다.")
 
     except Exception as e:
         print("\n[오류 발생]")
