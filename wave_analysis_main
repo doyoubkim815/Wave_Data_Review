@@ -1432,15 +1432,24 @@ def plot_detrend_review(df: pd.DataFrame, out_dir: Path, cfg: Config) -> Dict:
 
     x = df["analysis_time"] if "analysis_time" in df.columns else df.index
 
-    # 1) 전체 구간 depth vs eta_tide
-    fig, ax = plt.subplots(figsize=(12, 4.0))
-    ax.plot(x, df[cfg.depth_col], color="black", linewidth=0.8, label="depth")
-    ax.plot(x, df["eta_tide"], color="tab:orange", linewidth=0.9, label="eta_tide")
-    ax.set_title("Detrend Review (Full): depth vs eta_tide")
-    ax.set_ylabel("depth / eta_tide")
-    ax.set_xlabel("time")
-    ax.grid(alpha=0.3)
-    ax.legend(loc="best")
+    # 1) 전체 구간 depth vs eta_tide (이중 y축)
+    fig, ax_left = plt.subplots(figsize=(12, 4.0))
+    ax_right = ax_left.twinx()
+
+    line_depth, = ax_left.plot(x, df[cfg.depth_col], color="black", linewidth=0.8, label="depth")
+    line_tide, = ax_right.plot(x, df["eta_tide"], color="tab:orange", linewidth=0.9, label="eta_tide")
+
+    ax_left.set_title("Detrend Review (Full): depth vs eta_tide")
+    ax_left.set_xlabel("time")
+    ax_left.set_ylabel("depth", color="black")
+    ax_right.set_ylabel("eta_tide", color="tab:orange")
+    ax_left.tick_params(axis="y", colors="black")
+    ax_right.tick_params(axis="y", colors="tab:orange")
+    ax_left.grid(alpha=0.3)
+
+    lines = [line_depth, line_tide]
+    labels = [ln.get_label() for ln in lines]
+    ax_left.legend(lines, labels, loc="best")
     fig.tight_layout()
     full_path = out_dir / "detrend_review_depth_vs_tide_full.png"
     fig.savefig(full_path, dpi=150)
